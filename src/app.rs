@@ -17,7 +17,7 @@ use eframe::egui::{
 };
 use futures::StreamExt;
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -194,6 +194,9 @@ pub struct App {
     streams: Streams,
     pending_play: Option<PendingPlay>,
     hover_card: Option<(String, Instant)>,
+    /// Hover prefetch runs at most once per video. Failed attempts are retried
+    /// only when the user clicks, never every frame.
+    prefetched: HashSet<String>,
     /// First tile of the current grid, resolved before anyone clicks it.
     prefetch_top: Option<String>,
 
@@ -283,6 +286,7 @@ impl App {
             streams: Streams::default(),
             pending_play: None,
             hover_card: None,
+            prefetched: HashSet::new(),
             prefetch_top: None,
             route: Route::Trending,
             stack: Vec::new(),
@@ -761,7 +765,8 @@ impl App {
         }
         match &self.hover_card {
             Some((hovered, since)) if hovered == id => {
-                if since.elapsed() >= Duration::from_millis(140) {
+                if since.elapsed() >= Duration::from_millis(140) && !self.prefetched.contains(id) {
+                    self.prefetched.insert(id.to_string());
                     self.resolve(id);
                 }
             }

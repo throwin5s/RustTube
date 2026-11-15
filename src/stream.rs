@@ -202,12 +202,24 @@ fn ytdlp() -> std::path::PathBuf {
 }
 
 fn run_ytdlp(args: &[&str], url: &str) -> Result<Vec<u8>, String> {
-    let output = Command::new(ytdlp())
+    let mut command = Command::new(ytdlp());
+    command
         .args(args)
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Without CREATE_NO_WINDOW, every yt-dlp call from this GUI app opens
+        // a visible console window over the player.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = command
         .output()
         .map_err(|err| match err.kind() {
             std::io::ErrorKind::NotFound => "yt-dlp is not installed. Install it with \
