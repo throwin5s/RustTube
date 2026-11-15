@@ -18,7 +18,7 @@ env:
 
 jobs:
   macos:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -95,6 +95,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: msys2/setup-msys2@v2
+        id: msys2
         with:
           msystem: MINGW64
           update: false
@@ -102,8 +103,10 @@ jobs:
 
       - name: Add MinGW to PATH
         run: |
-          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-          & "C:\msys64\mingw64\bin\x86_64-w64-mingw32-gcc.exe" --version
+          $mingw = Join-Path "${{ steps.msys2.outputs.msys2-location }}" "mingw64\bin"
+          Write-Host "MinGW: $mingw"
+          $mingw | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          & (Join-Path $mingw "x86_64-w64-mingw32-gcc.exe") --version
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -153,8 +156,9 @@ jobs:
           # Rust's GNU target normally links these statically, but the C parts
           # (SQLite) can pull them in; ship them when present so the zip runs
           # on a clean Windows install.
+          $mingw = Join-Path "${{ steps.msys2.outputs.msys2-location }}" "mingw64\bin"
           foreach ($name in @("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll")) {
-            $src = Join-Path "C:\msys64\mingw64\bin" $name
+            $src = Join-Path $mingw $name
             if (Test-Path $src) { Copy-Item $src $out }
           }
           @"
