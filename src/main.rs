@@ -16,8 +16,8 @@ use eframe::egui;
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1360.0, 880.0])
-            .with_min_inner_size([980.0, 620.0])
+            .with_inner_size([1200.0, 740.0])
+            .with_min_inner_size([900.0, 560.0])
             .with_title("RustTube")
             .with_app_id("rusttube")
             .with_icon(window_icon()),

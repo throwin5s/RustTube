@@ -41,7 +41,6 @@ pub const OK: Color32 = Color32::from_rgb(0x1e, 0xd7, 0x60);
 pub const RADIUS: u8 = 8;
 pub const RADIUS_SMALL: u8 = 4;
 pub const TOP_BAR_HEIGHT: f32 = 56.0;
-pub const PLAYER_BAR_HEIGHT: f32 = 88.0;
 pub const SIDEBAR_WIDTH: f32 = 240.0;
 
 // --------------------------------------------------------------------- fonts
@@ -277,7 +276,6 @@ pub enum Icon {
     Pause,
     Stop,
     Back,
-    Forward,
 }
 
 pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32) -> Response {
@@ -329,16 +327,6 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: &Icon, color: Color
                     egui::pos2(c.x + s * 0.25, c.y - s * 0.4),
                     egui::pos2(c.x - s * 0.25, c.y),
                     egui::pos2(c.x + s * 0.25, c.y + s * 0.4),
-                ],
-                Stroke::new(1.8_f32, color),
-            ));
-        }
-        Icon::Forward => {
-            painter.add(egui::Shape::line(
-                vec![
-                    egui::pos2(c.x - s * 0.25, c.y - s * 0.4),
-                    egui::pos2(c.x + s * 0.25, c.y),
-                    egui::pos2(c.x - s * 0.25, c.y + s * 0.4),
                 ],
                 Stroke::new(1.8_f32, color),
             ));
