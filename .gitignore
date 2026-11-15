@@ -1,0 +1,9 @@
+/target
+/gen
+.DS_Store
+*.log
+/.freebuff/
+/.screens/
+# Sync snapshots are user data and must never be committed
+rusttube-sync.json
+.rusttube-sync.json.tmp

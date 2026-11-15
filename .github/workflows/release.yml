@@ -1,0 +1,190 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.2.0"
+        required: true
+        default: "v0.2.0"
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install mpv and dylibbundler
+        run: brew install mpv dylibbundler
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package .app
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          APP="RustTube.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
+          cp target/release/rusttube "$APP/Contents/MacOS/RustTube"
+          cp icons/icon.icns "$APP/Contents/Resources/AppIcon.icns"
+          curl -L --fail --retry 3 \
+            https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos \
+            -o "$APP/Contents/MacOS/yt-dlp"
+          chmod +x "$APP/Contents/MacOS/yt-dlp"
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>RustTube</string>
+            <key>CFBundleDisplayName</key><string>RustTube</string>
+            <key>CFBundleIdentifier</key><string>app.rusttube.player</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleExecutable</key><string>RustTube</string>
+            <key>CFBundleIconFile</key><string>AppIcon</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          dylibbundler -od -b -x "$APP/Contents/MacOS/RustTube" \
+            -d "$APP/Contents/Frameworks" \
+            -p "@executable_path/../Frameworks"
+          codesign --force --deep --sign - "$APP"
+          ditto -c -k --keepParent "$APP" "RustTube-${VERSION}-macos-arm64.zip"
+          ls -lh "RustTube-${VERSION}-macos-arm64.zip"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: RustTube ${{ env.TAG }}
+          body: |
+            Native macOS and Windows builds of RustTube, with libmpv and yt-dlp bundled.
+
+            - **macOS (Apple silicon):** unzip and move `RustTube.app` to Applications.
+              The build is unsigned, so the first launch needs right-click → Open
+              (or `xattr -dr com.apple.quarantine RustTube.app`).
+            - **Windows (x64):** unzip the folder and run `RustTube.exe`. The build is
+              unsigned, so SmartScreen may ask for More info → Run anyway.
+
+            Video is decoded and rendered in-process by libmpv; no separate player window.
+          files: RustTube-*-macos-arm64.zip
+          fail_on_unmatched_files: true
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+
+      - name: Add MinGW to PATH
+        run: |
+          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          & "C:\msys64\mingw64\bin\x86_64-w64-mingw32-gcc.exe" --version
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-gnu
+
+      - name: Fetch libmpv
+        run: |
+          $ErrorActionPreference = "Stop"
+          $rssUrl = "https://sourceforge.net/projects/mpv-player-windows/rss?path=/libmpv"
+          $rss = [xml](Invoke-WebRequest -UseBasicParsing $rssUrl).Content
+          $pick = @($rss.rss.channel.item) |
+            Where-Object { $_.title -match '^mpv-dev-x86_64-.*\.7z$' } |
+            Select-Object -First 1
+          if (-not $pick) { throw "No libmpv dev archive in the SourceForge feed" }
+          Write-Host "libmpv: $($pick.title)"
+          curl.exe -L --fail --retry 3 "$($pick.link)" -o libmpv.7z
+          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+          if (-not (Test-Path $sevenZip)) { $sevenZip = "7z" }
+          & $sevenZip x libmpv.7z -o"libmpv" -y | Out-Null
+          $importLib = Get-ChildItem -Recurse libmpv -Filter libmpv.dll.a | Select-Object -First 1
+          $dll = Get-ChildItem -Recurse libmpv -Filter "libmpv-2.dll" | Select-Object -First 1
+          if (-not $importLib) { throw "libmpv.dll.a missing from the archive" }
+          if (-not $dll) { throw "libmpv-2.dll missing from the archive" }
+          "LIBMPV_DIR=$($importLib.DirectoryName)" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "LIBMPV_DLL=$($dll.FullName)" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Package
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:TAG -replace '^v', ''
+          $out = "package\RustTube"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item "target\x86_64-pc-windows-gnu\release\rusttube.exe" "$out\RustTube.exe"
+          Copy-Item $env:LIBMPV_DLL "$out\libmpv-2.dll"
+          curl.exe -L --fail --retry 3 `
+            "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" `
+            -o "$out\yt-dlp.exe"
+          # Rust's GNU target normally links these statically, but the C parts
+          # (SQLite) can pull them in; ship them when present so the zip runs
+          # on a clean Windows install.
+          foreach ($name in @("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll")) {
+            $src = Join-Path "C:\msys64\mingw64\bin" $name
+            if (Test-Path $src) { Copy-Item $src $out }
+          }
+          @"
+          RustTube $env:TAG
+          ================
+
+          1. Keep RustTube.exe, libmpv-2.dll and yt-dlp.exe in the same folder.
+          2. Run RustTube.exe.
+          3. If SmartScreen appears: More info -> Run anyway.
+
+          This build is unsigned. Settings, history and subscriptions live in
+          %APPDATA%\RustTube.
+          "@ | Set-Content "$out\README.txt"
+          Get-ChildItem $out | Select-Object Name, Length
+          Compress-Archive -Path $out -DestinationPath "RustTube-$version-windows-x64.zip" -Force
+          Get-Item "RustTube-$version-windows-x64.zip" | Select-Object Name, Length
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: RustTube ${{ env.TAG }}
+          body: |
+            Native macOS and Windows builds of RustTube, with libmpv and yt-dlp bundled.
+
+            - **macOS (Apple silicon):** unzip and move `RustTube.app` to Applications.
+              The build is unsigned, so the first launch needs right-click → Open
+              (or `xattr -dr com.apple.quarantine RustTube.app`).
+            - **Windows (x64):** unzip the folder and run `RustTube.exe`. The build is
+              unsigned, so SmartScreen may ask for More info → Run anyway.
+
+            Video is decoded and rendered in-process by libmpv; no separate player window.
+          files: RustTube-*-windows-x64.zip
+          fail_on_unmatched_files: true
