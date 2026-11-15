@@ -121,8 +121,10 @@ jobs:
           $ErrorActionPreference = "Stop"
           $rssUrl = "https://sourceforge.net/projects/mpv-player-windows/rss?path=/libmpv"
           $rss = [xml](Invoke-WebRequest -UseBasicParsing $rssUrl).Content
+          # Titles are paths like /libmpv/mpv-dev-x86_64-2026...7z; skip the
+          # v3 build so the exe also runs on pre-AVX2 machines.
           $pick = @($rss.rss.channel.item) |
-            Where-Object { $_.title -match '^mpv-dev-x86_64-.*\.7z$' } |
+            Where-Object { $_.title -match 'mpv-dev-x86_64-[0-9].*\.7z$' } |
             Select-Object -First 1
           if (-not $pick) { throw "No libmpv dev archive in the SourceForge feed" }
           Write-Host "libmpv: $($pick.title)"
