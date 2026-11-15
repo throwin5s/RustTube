@@ -120,15 +120,15 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $rssUrl = "https://sourceforge.net/projects/mpv-player-windows/rss?path=/libmpv"
-          $rss = [xml](Invoke-WebRequest -UseBasicParsing $rssUrl).Content
-          # Titles are paths like /libmpv/mpv-dev-x86_64-2026...7z; skip the
-          # v3 build so the exe also runs on pre-AVX2 machines.
-          $pick = @($rss.rss.channel.item) |
-            Where-Object { $_.title -match 'mpv-dev-x86_64-[0-9].*\.7z$' } |
-            Select-Object -First 1
-          if (-not $pick) { throw "No libmpv dev archive in the SourceForge feed" }
-          Write-Host "libmpv: $($pick.title)"
-          curl.exe -L --fail --retry 3 "$($pick.link)" -o libmpv.7z
+          $content = [string](Invoke-WebRequest -UseBasicParsing $rssUrl).Content
+          # Parse the download URLs directly; the XML titles are CDATA paths.
+          # Skip the v3 build so the exe also runs on pre-AVX2 machines.
+          $pattern = 'https://sourceforge\.net/projects/mpv-player-windows/files/libmpv/mpv-dev-x86_64-\d[^"<]*\.7z/download'
+          $url = [regex]::Matches($content, $pattern) |
+            Select-Object -First 1 -ExpandProperty Value
+          if (-not $url) { throw "No libmpv dev archive in the SourceForge feed" }
+          Write-Host "libmpv: $url"
+          curl.exe -L --fail --retry 3 "$url" -o libmpv.7z
           $sevenZip = "C:\Program Files\7-Zip\7z.exe"
           if (-not (Test-Path $sevenZip)) { $sevenZip = "7z" }
           & $sevenZip x libmpv.7z -o"libmpv" -y | Out-Null
