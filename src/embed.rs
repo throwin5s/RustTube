@@ -344,7 +344,10 @@ impl Player {
     pub fn toggle_pause(&mut self) {
         let paused = self.snapshot().paused;
         if let Some(inner) = &self.inner {
-            inner.command(&["set_property", "pause", if paused { "no" } else { "yes" }]);
+            // mpv's command is `set` (there is no `set_property` command;
+            // that is only the C API name). Calling the wrong one failed
+            // silently, which made pause and volume look dead.
+            inner.command(&["set", "pause", if paused { "no" } else { "yes" }]);
         }
     }
 
@@ -359,7 +362,7 @@ impl Player {
         self.volume = volume.clamp(0, 130);
         if let Some(inner) = &self.inner {
             let value = self.volume.to_string();
-            inner.command(&["set_property", "volume", &value]);
+            inner.command(&["set", "volume", &value]);
         }
     }
 

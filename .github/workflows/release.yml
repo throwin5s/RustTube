@@ -83,6 +83,10 @@ jobs:
               unsigned, so SmartScreen may ask for More info → Run anyway.
 
             Video is decoded and rendered in-process by libmpv; no separate player window.
+
+            The commit-based changelog for this tag is generated below, so every
+            release lists exactly what changed since the previous one.
+          generate_release_notes: true
           files: RustTube-*-macos-arm64.zip
           fail_on_unmatched_files: true
 
@@ -192,5 +196,9 @@ jobs:
               unsigned, so SmartScreen may ask for More info → Run anyway.
 
             Video is decoded and rendered in-process by libmpv; no separate player window.
+
+            The commit-based changelog for this tag is generated below, so every
+            release lists exactly what changed since the previous one.
+          generate_release_notes: true
           files: RustTube-*-windows-x64.zip
           fail_on_unmatched_files: true

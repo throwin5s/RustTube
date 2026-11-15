@@ -90,6 +90,7 @@ enum Msg {
     Channel(String, Result<ChannelSummary, String>),
     ChannelMore(Vec<VideoCard>),
     Detail(String, Result<Box<VideoDetail>, String>),
+    SubAvatar(String, Option<String>),
     Sync(Result<SyncReport, String>),
 }
 
@@ -194,6 +195,9 @@ pub struct App {
     streams: Streams,
     pending_play: Option<PendingPlay>,
     hover_card: Option<(String, Instant)>,
+    /// Channels we already asked the API for a missing subscription avatar,
+    /// so a failing request never retries every frame.
+    avatar_requests: HashSet<String>,
     /// Hover prefetch runs at most once per video. Failed attempts are retried
     /// only when the user clicks, never every frame.
     prefetched: HashSet<String>,
@@ -286,6 +290,7 @@ impl App {
             streams: Streams::default(),
             pending_play: None,
             hover_card: None,
+            avatar_requests: HashSet::new(),
             prefetched: HashSet::new(),
             prefetch_top: None,
             route: Route::Trending,
@@ -660,6 +665,27 @@ impl App {
         self.subs = self
             .with_db(|conn| db::list_subscriptions(conn))
             .unwrap_or_default();
+
+        // Subscriptions saved before avatars were stored have no image.
+        // Fetch each one once so the sidebar can show the real logo.
+        let missing: Vec<String> = self
+            .subs
+            .iter()
+            .filter(|sub| sub.channel_avatar.is_empty())
+            .map(|sub| sub.channel_id.clone())
+            .collect();
+        for id in missing {
+            if !self.avatar_requests.insert(id.clone()) {
+                continue;
+            }
+            let api = self.api.clone();
+            self.spawn(async move {
+                Msg::SubAvatar(
+                    id.clone(),
+                    api.channel(&id).await.map(|channel| channel.avatar).ok(),
+                )
+            });
+        }
     }
 
     fn sync_now(&mut self) {
@@ -803,14 +829,14 @@ impl App {
         });
     }
 
-    fn toggle_subscription(&mut self, channel_id: &str, name: &str) {
+    fn toggle_subscription(&mut self, channel_id: &str, name: &str, avatar: &str) {
         if channel_id.is_empty() {
             self.toast("Channel is still loading");
             return;
         }
         let now = self.with_db(|conn| {
             let subscribed = db::is_subscribed(conn, channel_id);
-            db::set_subscription(conn, channel_id, name, "", !subscribed)
+            db::set_subscription(conn, channel_id, name, avatar, !subscribed)
                 .map(|state| state)
                 .unwrap_or(false)
         });
@@ -960,6 +986,16 @@ impl App {
                         if self.channel_videos.is_empty() {
                             self.channel_videos = channel.videos.clone();
                         }
+                        if !channel.avatar.is_empty()
+                            && self
+                                .with_db(|conn| db::is_subscribed(conn, &channel.id))
+                                .unwrap_or(false)
+                        {
+                            let _ = self.with_db(|conn| {
+                                db::set_subscription_avatar(conn, &channel.id, &channel.avatar)
+                            });
+                            self.refresh_subs();
+                        }
                     }
                     self.channel = loaded(result);
                 }
@@ -973,6 +1009,14 @@ impl App {
                     } else {
                         self.detail = loaded(result.map(|boxed| *boxed));
                     }
+                }
+            }
+            Msg::SubAvatar(id, avatar) => {
+                if let Some(url) = avatar.filter(|url| !url.is_empty()) {
+                    let _ = self.with_db(|conn| {
+                        db::set_subscription_avatar(conn, &id, &url)
+                    });
+                    self.refresh_subs();
                 }
             }
             Msg::Sync(result) => {
@@ -1153,9 +1197,19 @@ impl App {
                             } else {
                                 sub.channel_name.clone()
                             };
-                            if t::nav_row(ui, &label, false).clicked() {
-                                self.navigate(Route::Channel(sub.channel_id.clone()));
-                            }
+                            ui.horizontal(|ui| {
+                                self.paint_avatar(ui, &label, &sub.channel_avatar, 22.0);
+                                let row = ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&label).size(13.0).color(t::DIM),
+                                    )
+                                    .sense(egui::Sense::click()),
+                                );
+                                if row.clicked() {
+                                    self.navigate(Route::Channel(sub.channel_id.clone()));
+                                }
+                            });
+                            ui.add_space(4.0);
                         }
                     });
             });
@@ -1172,6 +1226,33 @@ impl App {
             }
             None => t::placeholder_thumbnail(ui.painter(), rect),
         }
+    }
+
+    /// Circular channel avatar: real artwork when it loads, initials only as
+    /// the fallback while the image is missing or still downloading.
+    fn paint_avatar(&self, ui: &mut Ui, name: &str, url: &str, diameter: f32) {
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::splat(diameter), egui::Sense::hover());
+        if !url.is_empty() {
+            let key = format!("avatar:{url}");
+            if let Some(texture) = self.thumbs.get(&self.ctx, &key, url.to_string()) {
+                egui::Image::from_texture(egui::load::SizedTexture::from_handle(&texture))
+                    .corner_radius(CornerRadius::same(
+                        (diameter * 0.5).round().clamp(0.0, 255.0) as u8
+                    ))
+                    .paint_at(ui, rect);
+                return;
+            }
+        }
+        ui.painter()
+            .circle_filled(rect.center(), diameter * 0.5, t::PANEL_2);
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            t::initials(name),
+            t::semibold(diameter * 0.36),
+            t::DIM,
+        );
     }
 
     // -------------------------------------------------------------------- views
@@ -1378,7 +1459,7 @@ impl App {
         }
 
         ui.horizontal(|ui| {
-            t::avatar(ui, &channel.name, 64.0);
+            self.paint_avatar(ui, &channel.name, &channel.avatar, 64.0);
             ui.vertical(|ui| {
                 t::h1(ui, &channel.name);
                 let mut meta = Vec::new();
@@ -1398,7 +1479,7 @@ impl App {
                     t::accent_button(ui, label)
                 };
                 if button.clicked() {
-                    self.toggle_subscription(&id, &channel.name);
+                    self.toggle_subscription(&id, &channel.name, &channel.avatar);
                 }
             });
         });
@@ -1484,9 +1565,9 @@ impl App {
                             Color32::BLACK,
                         );
                         self.player.paint(ui, poster);
-                        // Only the pause affordance, and only while playing:
-                        // a paused video has no overlay glyph.
-                        if response.hovered() && !snapshot.paused {
+                        // A play affordance appears only while paused, so
+                        // hovering a playing video never changes its picture.
+                        if snapshot.paused {
                             let center = poster.center();
                             ui.painter().circle_filled(
                                 center,
@@ -1496,7 +1577,7 @@ impl App {
                             t::paint_icon(
                                 ui.painter(),
                                 Rect::from_center_size(center, Vec2::splat(28.0)),
-                                &t::Icon::Pause,
+                                &t::Icon::Play,
                                 t::TEXT,
                             );
                         }
@@ -1549,15 +1630,6 @@ impl App {
                             {
                                 self.player.toggle_pause();
                             }
-                            if t::icon_button(ui, t::Icon::Stop, 22.0)
-                                .on_hover_text("Stop and unload")
-                                .clicked()
-                            {
-                                self.flush_watch();
-                                self.player.stop();
-                                self.attempted = None;
-                            }
-
                             let duration = if snapshot.duration > 0.0 {
                                 snapshot.duration
                             } else {
@@ -1574,8 +1646,8 @@ impl App {
                             };
                             ui.label(RichText::new(time_text).size(11.5).color(t::DIM_2));
 
-                            let show_volume = ui.available_width() > 330.0;
-                            let reserve = if show_volume { 106.0 } else { 0.0 };
+                            let show_volume = ui.available_width() > 350.0;
+                            let reserve = if show_volume { 122.0 } else { 0.0 };
                             let progress_width = (ui.available_width() - reserve).max(60.0);
                             ui.allocate_ui_with_layout(
                                 Vec2::new(progress_width, 16.0),
@@ -1601,18 +1673,23 @@ impl App {
                             );
 
                             if show_volume {
-                                let mut volume = self.player.volume as f32;
-                                let slider = egui::Slider::new(&mut volume, 0.0..=130.0)
-                                    .show_value(false)
-                                    .trailing_fill(true);
-                                if ui.add_sized([90.0, 16.0], slider).changed() {
-                                    self.player.set_volume(volume as i32);
+                                let (icon, _) = ui.allocate_exact_size(
+                                    Vec2::splat(16.0),
+                                    egui::Sense::hover(),
+                                );
+                                t::paint_icon(
+                                    ui.painter(),
+                                    icon,
+                                    &t::Icon::Volume,
+                                    t::DIM_2,
+                                );
+                                if let Some(volume) =
+                                    t::volume_slider(ui, self.player.volume as f32)
+                                {
+                                    let volume = volume.round() as i32;
+                                    self.player.set_volume(volume);
                                     let _ = self.with_db(|conn| {
-                                        db::set_setting(
-                                            conn,
-                                            "volume",
-                                            &(volume as i32).to_string(),
-                                        )
+                                        db::set_setting(conn, "volume", &volume.to_string())
                                     });
                                 }
                             }
@@ -1639,7 +1716,7 @@ impl App {
 
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        t::avatar(ui, &card.channel_name, 38.0);
+                        self.paint_avatar(ui, &card.channel_name, &card.channel_avatar, 38.0);
                         ui.vertical(|ui| {
                             let name = ui
                                 .add(
@@ -1670,7 +1747,11 @@ impl App {
                             t::accent_button(ui, label)
                         };
                         if button.clicked() {
-                            self.toggle_subscription(&card.channel_id, &card.channel_name);
+                            self.toggle_subscription(
+                                &card.channel_id,
+                                &card.channel_name,
+                                &card.channel_avatar,
+                            );
                         }
                         if !card.channel_id.is_empty() && t::quiet_button(ui, "Channel").clicked() {
                             self.navigate(Route::Channel(card.channel_id.clone()));
@@ -1695,19 +1776,39 @@ impl App {
                     ui.add_space(12.0);
                     let description = detail
                         .as_ref()
-                        .map(|d| d.description.clone())
-                        .unwrap_or_else(|| "No description available.".into());
+                        .map(|d| d.description.trim().to_string())
+                        .unwrap_or_default();
                     t::panel_frame().show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("description")
-                            .max_height(150.0)
-                            .show(ui, |ui| {
-                                ui.label(
-                                    RichText::new(description)
-                                        .size(12.8)
-                                        .color(Color32::from_rgb(0xc6, 0xc6, 0xd0)),
-                                );
+                        if !description.is_empty() {
+                            egui::ScrollArea::vertical()
+                                .id_salt("description")
+                                .max_height(150.0)
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(description)
+                                            .size(12.8)
+                                            .color(Color32::from_rgb(0xc6, 0xc6, 0xd0)),
+                                    );
+                                });
+                        } else {
+                            ui.horizontal(|ui| {
+                                let message = match &self.detail {
+                                    Load::Failed(err) => {
+                                        format!("Description unavailable: {err}")
+                                    }
+                                    Load::Loading => "Loading description…".to_string(),
+                                    _ => "No description available.".to_string(),
+                                };
+                                ui.label(RichText::new(message).size(12.2).color(t::DIM_2));
+                                if matches!(self.detail, Load::Failed(_))
+                                    && t::quiet_button(ui, "Retry").clicked()
+                                {
+                                    self.detail = Load::Idle;
+                                    self.detail_id.clear();
+                                    self.ensure_loaded();
+                                }
                             });
+                        }
                     });
                 },
             );

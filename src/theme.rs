@@ -274,8 +274,8 @@ pub fn nav_row(ui: &mut Ui, label: &str, active: bool) -> Response {
 pub enum Icon {
     Play,
     Pause,
-    Stop,
     Back,
+    Volume,
 }
 
 pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32) -> Response {
@@ -314,13 +314,6 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: &Icon, color: Color
                 color,
             );
         }
-        Icon::Stop => {
-            painter.rect_filled(
-                Rect::from_center_size(c, Vec2::splat(s * 0.72)),
-                CornerRadius::same(RADIUS_SMALL),
-                color,
-            );
-        }
         Icon::Back => {
             painter.add(egui::Shape::line(
                 vec![
@@ -329,6 +322,40 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: &Icon, color: Color
                     egui::pos2(c.x + s * 0.25, c.y + s * 0.4),
                 ],
                 Stroke::new(1.8_f32, color),
+            ));
+        }
+        Icon::Volume => {
+            painter.rect_filled(
+                Rect::from_center_size(
+                    egui::pos2(c.x - s * 0.26, c.y),
+                    Vec2::new(s * 0.30, s * 0.34),
+                ),
+                CornerRadius::same(1),
+                color,
+            );
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(c.x - s * 0.12, c.y - s * 0.18),
+                    egui::pos2(c.x - s * 0.12, c.y + s * 0.18),
+                    egui::pos2(c.x + s * 0.12, c.y + s * 0.38),
+                    egui::pos2(c.x + s * 0.12, c.y - s * 0.38),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+            painter.add(egui::Shape::line(
+                vec![
+                    egui::pos2(c.x + s * 0.28, c.y - s * 0.14),
+                    egui::pos2(c.x + s * 0.28, c.y + s * 0.14),
+                ],
+                Stroke::new(1.4_f32, color),
+            ));
+            painter.add(egui::Shape::line(
+                vec![
+                    egui::pos2(c.x + s * 0.42, c.y - s * 0.28),
+                    egui::pos2(c.x + s * 0.42, c.y + s * 0.28),
+                ],
+                Stroke::new(1.4_f32, color),
             ));
         }
     }
@@ -368,6 +395,38 @@ pub fn progress(ui: &mut Ui, fraction: f32, height: f32, hovered_fill: Color32) 
             .circle_filled(knob.center(), height * 0.95, TEXT);
     }
     (response, line)
+}
+
+/// Compact volume control drawn in the same visual language as the seek bar.
+/// Returns the new 0–130 value while the user clicks or drags it.
+pub fn volume_slider(ui: &mut Ui, value: f32) -> Option<f32> {
+    let width = 96.0;
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(width, 18.0), Sense::click_and_drag());
+    let line = Rect::from_center_size(rect.center(), Vec2::new(width, 5.0));
+    let radius = CornerRadius::same(RADIUS);
+    ui.painter().rect_filled(line, radius, PANEL_3);
+    let fraction = (value / 130.0).clamp(0.0, 1.0);
+    let filled = Rect::from_min_size(line.min, Vec2::new(width * fraction, 5.0));
+    if fraction > 0.0 {
+        ui.painter().rect_filled(filled, radius, ACCENT);
+    }
+    ui.painter().circle_filled(
+        egui::pos2(line.left() + width * fraction, line.center().y),
+        if response.hovered() || response.dragged() {
+            4.5
+        } else {
+            3.2
+        },
+        TEXT,
+    );
+    if response.clicked() || response.dragged() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let ratio = ((pos.x - line.left()) / width).clamp(0.0, 1.0);
+            return Some(ratio * 130.0);
+        }
+    }
+    None
 }
 
 // ----------------------------------------------------------------- formatting
@@ -450,15 +509,3 @@ pub fn initials(name: &str) -> String {
         .to_uppercase()
 }
 
-/// Circular initials avatar drawn without any network round trip.
-pub fn avatar(ui: &mut Ui, name: &str, diameter: f32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(diameter), Sense::hover());
-    ui.painter().circle_filled(rect.center(), diameter * 0.5, PANEL_2);
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        initials(name),
-        semibold(diameter * 0.36),
-        DIM,
-    );
-}

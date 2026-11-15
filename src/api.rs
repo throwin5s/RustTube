@@ -183,7 +183,16 @@ impl Api {
             return Err(format!("HTTP {}", status.as_u16()));
         }
         let text = res.text().await.map_err(|e| e.to_string())?;
-        serde_json::from_str::<Value>(&text).map_err(|_| "instance returned a non-JSON response".to_string())
+        let value = serde_json::from_str::<Value>(&text)
+            .map_err(|_| "instance returned a non-JSON response".to_string())?;
+        // Invidious and Piped both report failures as HTTP 200 with an
+        // `error` field. Treating that as success stopped the endpoint loop,
+        // so detail, descriptions and related videos stayed empty even when
+        // the next instance could answer.
+        if let Some(error) = value.get("error").and_then(|v| v.as_str()) {
+            return Err(short_error(error));
+        }
+        Ok(value)
     }
 
     /// Try Invidious and Piped variants across every endpoint until one answers.

@@ -222,6 +222,20 @@ pub fn is_subscribed(conn: &Connection, channel_id: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// Backfill the artwork for a subscription that was saved without one.
+pub fn set_subscription_avatar(
+    conn: &Connection,
+    channel_id: &str,
+    avatar: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE subscriptions SET channel_avatar = ?2, updated_at = ?3 \
+         WHERE channel_id = ?1",
+        params![channel_id, avatar, now_ms()],
+    )?;
+    Ok(())
+}
+
 /// Subscribe or unsubscribe. Unsubscribing writes a tombstone so the change
 /// survives a merge with a machine that still has the old record.
 pub fn set_subscription(
