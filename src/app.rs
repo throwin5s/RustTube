@@ -410,11 +410,21 @@ impl App {
 
     // ------------------------------------------------------------- navigation
 
+    /// Leaving the watch page ends playback: otherwise backing out of a live
+    /// stream or a video leaves it running under the next page.
+    fn leave_watch(&mut self) {
+        if matches!(self.route, Route::Watch(_)) {
+            self.flush_watch();
+            if self.player.is_active() {
+                self.player.stop();
+                self.attempted = None;
+            }
+        }
+    }
+
     fn navigate(&mut self, route: Route) {
         if self.route != route {
-            if matches!(self.route, Route::Watch(_)) {
-                self.flush_watch();
-            }
+            self.leave_watch();
             self.stack.push(self.route.clone());
             if self.stack.len() > 40 {
                 self.stack.remove(0);
@@ -426,9 +436,7 @@ impl App {
 
     fn back(&mut self) {
         if let Some(previous) = self.stack.pop() {
-            if matches!(self.route, Route::Watch(_)) {
-                self.flush_watch();
-            }
+            self.leave_watch();
             self.route = previous;
             self.ensure_loaded();
         }
@@ -1182,58 +1190,106 @@ impl App {
                     .inner_margin(Margin::symmetric(16, 12)),
             )
             .show(ctx, |ui| {
+                let total = ui.available_width();
+                let show_meta = total >= 900.0;
+                let show_volume = total >= 620.0;
+                let volume_width = if show_volume { 132.0 } else { 0.0 };
+
                 ui.horizontal(|ui| {
-                    let (thumb_rect, _) = ui.allocate_exact_size(Vec2::new(96.0, 54.0), Sense::hover());
-                    self.paint_thumb(ui, thumb_rect, &now.video_id, "mq");
+                    if show_meta {
+                        let (thumb_rect, _) =
+                            ui.allocate_exact_size(Vec2::new(96.0, 54.0), Sense::hover());
+                        self.paint_thumb(ui, thumb_rect, &now.video_id, "mq");
 
-                    ui.add_space(4.0);
-                    ui.vertical(|ui| {
-                        ui.set_width(240.0);
-                        ui.add(
-                            egui::Label::new(RichText::new(&now.title).font(t::semibold(13.5)))
+                        ui.add_space(4.0);
+                        ui.vertical(|ui| {
+                            ui.set_width(220.0);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&now.title).font(t::semibold(13.5)),
+                                )
                                 .truncate(),
-                        )
-                        .on_hover_text(&now.title);
-                        ui.label(
-                            RichText::new(&now.channel_name).font(t::regular(12.0)).color(t::DIM),
-                        );
-                    });
+                            )
+                            .on_hover_text(&now.title);
+                            ui.label(
+                                RichText::new(&now.channel_name)
+                                    .font(t::regular(12.0))
+                                    .color(t::DIM),
+                            );
+                        });
 
-                    ui.add_space(8.0);
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            let (kind, label) = if snapshot.paused {
-                                (t::Icon::Play, "Play")
-                            } else {
-                                (t::Icon::Pause, "Pause")
-                            };
-                            if t::icon_button(ui, kind, 30.0)
-                                .on_hover_text(label)
-                                .clicked()
-                            {
-                                self.player.toggle_pause();
-                            }
-                            if t::icon_button(ui, t::Icon::Back, 26.0)
-                                .on_hover_text("Back 10 seconds")
-                                .clicked()
-                            {
-                                self.player.seek(-10.0);
-                            }
-                            if t::icon_button(ui, t::Icon::Forward, 26.0)
-                                .on_hover_text("Forward 10 seconds")
-                                .clicked()
-                            {
-                                self.player.seek(10.0);
-                            }
-                            if t::icon_button(ui, t::Icon::Stop, 24.0)
-                                .on_hover_text("Stop")
-                                .clicked()
-                            {
-                                self.flush_watch();
-                                self.player.stop();
-                                self.attempted = None;
-                            }
+                        ui.add_space(8.0);
+                    }
 
+                    // Reserve the volume strip before giving the progress bar a
+                    // width: letting it consume all remaining space pushed the
+                    // time and volume controls out of the panel on small windows.
+                    let controls_width =
+                        (ui.available_width() - volume_width - 8.0).max(280.0);
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(controls_width, 56.0),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                let (kind, label) = if snapshot.paused {
+                                    (t::Icon::Play, "Play")
+                                } else {
+                                    (t::Icon::Pause, "Pause")
+                                };
+                                if t::icon_button(ui, kind, 30.0)
+                                    .on_hover_text(label)
+                                    .clicked()
+                                {
+                                    self.player.toggle_pause();
+                                }
+                                if t::icon_button(ui, t::Icon::Back, 26.0)
+                                    .on_hover_text("Back 10 seconds")
+                                    .clicked()
+                                {
+                                    self.player.seek(-10.0);
+                                }
+                                if t::icon_button(ui, t::Icon::Forward, 26.0)
+                                    .on_hover_text("Forward 10 seconds")
+                                    .clicked()
+                                {
+                                    self.player.seek(10.0);
+                                }
+                                if t::icon_button(ui, t::Icon::Stop, 24.0)
+                                    .on_hover_text("Stop")
+                                    .clicked()
+                                {
+                                    self.flush_watch();
+                                    self.player.stop();
+                                    self.attempted = None;
+                                }
+
+                                let duration = if snapshot.duration > 0.0 {
+                                    snapshot.duration
+                                } else {
+                                    now.duration_hint as f64
+                                };
+                                let time_text = if snapshot.started {
+                                    format!(
+                                        "{} / {}",
+                                        t::format_clock(snapshot.position),
+                                        t::format_clock(duration)
+                                    )
+                                } else {
+                                    "Starting…".to_string()
+                                };
+                                ui.with_layout(
+                                    Layout::right_to_left(Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new(time_text)
+                                                .size(11.5)
+                                                .color(t::DIM_2),
+                                        );
+                                    },
+                                );
+                            });
+
+                            ui.add_space(2.0);
                             let duration = if snapshot.duration > 0.0 {
                                 snapshot.duration
                             } else {
@@ -1244,8 +1300,7 @@ impl App {
                             } else {
                                 0.0
                             };
-                            let (response, line) =
-                                t::progress(ui, fraction, 4.0, t::ACCENT);
+                            let (response, line) = t::progress(ui, fraction, 4.0, t::ACCENT);
                             if let Some(pos) = response.interact_pointer_pos() {
                                 if duration > 0.0 {
                                     let ratio =
@@ -1254,32 +1309,24 @@ impl App {
                                     self.player.seek(target - snapshot.position);
                                 }
                             }
-                            let time_text = if snapshot.started {
-                                format!(
-                                    "{} / {}",
-                                    t::format_clock(snapshot.position),
-                                    t::format_clock(duration)
-                                )
-                            } else {
-                                "Starting…".to_string()
-                            };
-                            ui.label(RichText::new(time_text).size(11.5).color(t::DIM_2));
-                        });
-                    });
+                        },
+                    );
 
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let mut volume = self.player.volume as f32;
-                        let slider = egui::Slider::new(&mut volume, 0.0..=130.0)
-                            .show_value(false)
-                            .trailing_fill(true);
-                        if ui.add_sized([110.0, 16.0], slider).changed() {
-                            self.player.set_volume(volume as i32);
-                            let _ = self.with_db(|conn| {
-                                db::set_setting(conn, "volume", &(volume as i32).to_string())
-                            });
-                        }
-                        ui.label(RichText::new("Volume").size(11.0).color(t::DIM_2));
-                    });
+                    if show_volume {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let mut volume = self.player.volume as f32;
+                            let slider = egui::Slider::new(&mut volume, 0.0..=130.0)
+                                .show_value(false)
+                                .trailing_fill(true);
+                            if ui.add_sized([110.0, 16.0], slider).changed() {
+                                self.player.set_volume(volume as i32);
+                                let _ = self.with_db(|conn| {
+                                    db::set_setting(conn, "volume", &(volume as i32).to_string())
+                                });
+                            }
+                            ui.label(RichText::new("Volume").size(11.0).color(t::DIM_2));
+                        });
+                    }
                 });
             });
     }
@@ -1607,22 +1654,19 @@ impl App {
                             Color32::BLACK,
                         );
                         self.player.paint(ui, poster);
-                        if response.hovered() {
+                        // Only the pause affordance, and only while playing:
+                        // a paused video has no overlay glyph.
+                        if response.hovered() && !snapshot.paused {
                             let center = poster.center();
                             ui.painter().circle_filled(
                                 center,
                                 26.0,
                                 Color32::from_black_alpha(170),
                             );
-                            let icon = if snapshot.paused {
-                                t::Icon::Play
-                            } else {
-                                t::Icon::Pause
-                            };
                             t::paint_icon(
                                 ui.painter(),
                                 Rect::from_center_size(center, Vec2::splat(28.0)),
-                                &icon,
+                                &t::Icon::Pause,
                                 t::TEXT,
                             );
                         }
