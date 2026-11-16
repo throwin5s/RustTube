@@ -81,7 +81,7 @@ jobs:
             echo '- **macOS (Apple silicon):** unzip and move `RustTube.app` to Applications. The build is unsigned, so the first launch needs right-click → Open (or `xattr -dr com.apple.quarantine RustTube.app`).'
             echo '- **Windows (x64):** unzip the folder and run `RustTube.exe`. The build is unsigned, so SmartScreen may ask for More info → Run anyway.'
             echo
-            echo 'Video is decoded and rendered in-process by libmpv; no separate player window.'
+            echo 'Embedded playback renders through libmpv inside RustTube; Settings > Playback can open a separate mpv window.'
             echo
             echo "## What changed in $TAG"
             git log --no-merges --pretty=format:'- %s (%h)' "$range"
@@ -199,7 +199,7 @@ jobs:
             '- **macOS (Apple silicon):** unzip and move `RustTube.app` to Applications. The build is unsigned, so the first launch needs right-click → Open (or `xattr -dr com.apple.quarantine RustTube.app`).',
             '- **Windows (x64):** unzip the folder and run `RustTube.exe`. The build is unsigned, so SmartScreen may ask for More info → Run anyway.',
             '',
-            'Video is decoded and rendered in-process by libmpv; no separate player window.',
+            'Embedded playback renders through libmpv inside RustTube; Settings > Playback can open a separate mpv window.',
             '',
             "## What changed in $env:TAG"
           )

@@ -7,7 +7,6 @@
 
 use crate::api::{Api, ChannelCard, ChannelSummary, SearchResults, VideoCard, VideoDetail};
 use crate::db::{self, HistoryEntry, StatsOverview, Subscription};
-use crate::embed::Player;
 use crate::stream::{self, Resolved, Streams};
 use crate::sync::{self, SyncReport, SyncSettings};
 use crate::theme as t;
@@ -98,6 +97,8 @@ enum Msg {
 struct SettingsDraft {
     region: String,
     api_base: String,
+    playback: String,
+    mpv_path: String,
     api_current: String,
     history_enabled: bool,
     sync_mode: String,
@@ -181,6 +182,231 @@ struct PendingPlay {
     start_at: f64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlaybackMode {
+    Embedded,
+    External,
+}
+
+impl PlaybackMode {
+    fn from_setting(value: &str) -> Self {
+        if value == "mpv" {
+            Self::External
+        } else {
+            Self::Embedded
+        }
+    }
+
+    fn setting(self) -> &'static str {
+        match self {
+            Self::Embedded => "embedded",
+            Self::External => "mpv",
+        }
+    }
+}
+
+/// One playback API over the libmpv renderer and the separate-mpv process.
+/// The embedded player is always created because its OpenGL render context has
+/// to exist before the first frame; it sits idle while external playback is on.
+struct Backend {
+    mode: PlaybackMode,
+    embedded: crate::embed::Player,
+    external: Option<crate::player::Player>,
+    mpv: PathBuf,
+}
+
+impl Backend {
+    fn new(mode: PlaybackMode, volume: i32, mpv: PathBuf, ctx: egui::Context) -> Self {
+        let mut backend = Self {
+            mode,
+            embedded: crate::embed::Player::new(volume, ctx),
+            external: None,
+            mpv,
+        };
+        if mode == PlaybackMode::External {
+            backend.ensure_external();
+            backend.warm();
+        }
+        backend
+    }
+
+    fn ensure_external(&mut self) {
+        if self.external.is_none() {
+            self.external = Some(crate::player::Player::new(
+                self.embedded.volume,
+                self.mpv.clone(),
+            ));
+        }
+    }
+
+    fn is_external(&self) -> bool {
+        self.mode == PlaybackMode::External
+    }
+
+    fn configure(&mut self, mode: PlaybackMode, mpv: PathBuf) {
+        let path_changed = mpv != self.mpv;
+        if self.mode == mode && !path_changed {
+            return;
+        }
+        self.stop();
+        if path_changed {
+            if let Some(mut external) = self.external.take() {
+                external.quit();
+            }
+            self.mpv = mpv;
+        }
+        self.mode = mode;
+        if mode == PlaybackMode::External {
+            self.ensure_external();
+            self.warm();
+        }
+    }
+
+    fn snapshot(&self) -> crate::embed::Snapshot {
+        if self.is_external() {
+            if let Some(external) = &self.external {
+                return external.snapshot();
+            }
+        }
+        self.embedded.snapshot()
+    }
+
+    fn now(&self) -> Option<&crate::embed::NowPlaying> {
+        if self.is_external() {
+            if let Some(external) = &self.external {
+                return external.now.as_ref();
+            }
+        }
+        self.embedded.now.as_ref()
+    }
+
+    fn volume(&self) -> i32 {
+        if self.is_external() {
+            if let Some(external) = &self.external {
+                return external.volume;
+            }
+        }
+        self.embedded.volume
+    }
+
+    fn is_active(&self) -> bool {
+        if self.is_external() {
+            self.external
+                .as_ref()
+                .map(crate::player::Player::is_active)
+                .unwrap_or(false)
+        } else {
+            self.embedded.is_active()
+        }
+    }
+
+    fn begin(
+        &mut self,
+        video_id: &str,
+        title: &str,
+        channel_id: &str,
+        channel_name: &str,
+        duration_hint: i64,
+    ) -> Result<(), String> {
+        if self.is_external() {
+            self.ensure_external();
+            if let Some(external) = &mut self.external {
+                return external.begin(
+                    video_id,
+                    title,
+                    channel_id,
+                    channel_name,
+                    duration_hint,
+                );
+            }
+        }
+        self.embedded
+            .begin(video_id, title, channel_id, channel_name, duration_hint)
+    }
+
+    fn load(&mut self, video: &str, audio: Option<&str>, video_id: &str, start_at: f64) {
+        if self.is_external() {
+            self.ensure_external();
+            if let Some(external) = &mut self.external {
+                external.load(video, audio, video_id, start_at);
+            }
+        } else {
+            self.embedded.load(video, audio, video_id, start_at);
+        }
+    }
+
+    fn warm(&mut self) {
+        if self.is_external() {
+            self.ensure_external();
+            if let Some(external) = &mut self.external {
+                external.warm();
+            }
+        } else {
+            self.embedded.warm();
+        }
+    }
+
+    fn toggle_pause(&mut self) {
+        if self.is_external() {
+            if let Some(external) = &mut self.external {
+                external.toggle_pause();
+            }
+        } else {
+            self.embedded.toggle_pause();
+        }
+    }
+
+    fn seek(&mut self, seconds: f64) {
+        if self.is_external() {
+            if let Some(external) = &mut self.external {
+                external.seek(seconds);
+            }
+        } else {
+            self.embedded.seek(seconds);
+        }
+    }
+
+    fn set_volume(&mut self, volume: i32) {
+        self.embedded.set_volume(volume);
+        if let Some(external) = &mut self.external {
+            external.set_volume(volume);
+        }
+    }
+
+    fn stop(&mut self) {
+        if self.is_external() {
+            if let Some(external) = &mut self.external {
+                external.stop();
+            }
+        } else {
+            self.embedded.stop();
+        }
+    }
+
+    fn take_error(&mut self) -> Option<String> {
+        if self.is_external() {
+            self.external
+                .as_mut()
+                .and_then(crate::player::Player::take_error)
+        } else {
+            self.embedded.take_error()
+        }
+    }
+
+    fn quit(&mut self) {
+        self.embedded.quit();
+        if let Some(external) = &mut self.external {
+            external.quit();
+        }
+    }
+
+    fn paint(&self, ui: &egui::Ui, rect: Rect) {
+        if !self.is_external() {
+            self.embedded.paint(ui, rect);
+        }
+    }
+}
+
 pub struct App {
     rt: tokio::runtime::Runtime,
     tx: Sender<Msg>,
@@ -191,7 +417,7 @@ pub struct App {
     device: String,
     db_path: PathBuf,
     thumbs: Thumbs,
-    player: Player,
+    player: Backend,
     streams: Streams,
     pending_play: Option<PendingPlay>,
     hover_card: Option<(String, Instant)>,
@@ -273,8 +499,14 @@ impl App {
         let volume = db::get_setting(&conn, "volume")
             .and_then(|v| v.parse::<i32>().ok())
             .unwrap_or(80);
+        let mode = PlaybackMode::from_setting(
+            &db::get_setting(&conn, "playback").unwrap_or_default(),
+        );
+        let mpv_path = crate::player::executable(
+            &db::get_setting(&conn, "mpv_path").unwrap_or_default(),
+        );
 
-        let player = Player::new(volume, ctx.clone());
+        let player = Backend::new(mode, volume, mpv_path, ctx.clone());
 
         let mut app = App {
             thumbs: Thumbs::new(rt.handle().clone()),
@@ -587,6 +819,9 @@ impl App {
             SettingsDraft {
                 region: db::get_setting(conn, "region").unwrap_or_else(|| "US".into()),
                 api_base: db::get_setting(conn, "api_base").unwrap_or_default(),
+                playback: db::get_setting(conn, "playback")
+                    .unwrap_or_else(|| "embedded".into()),
+                mpv_path: db::get_setting(conn, "mpv_path").unwrap_or_default(),
                 api_current: self.api.current_endpoint(),
                 history_enabled: db::get_setting(conn, "history_enabled")
                     .map(|v| v != "0")
@@ -608,9 +843,15 @@ impl App {
 
     fn save_settings(&mut self) {
         let draft = self.settings.clone();
+        let old_mode = PlaybackMode::from_setting(&self.settings.playback);
+        let old_mpv = self.settings.mpv_path.trim().to_string();
+        let new_mode = PlaybackMode::from_setting(&draft.playback);
+        let new_mpv = draft.mpv_path.trim().to_string();
         let saved = self.with_db(|conn| {
             let _ = db::set_setting(conn, "region", &draft.region);
             let _ = db::set_setting(conn, "api_base", draft.api_base.trim());
+            let _ = db::set_setting(conn, "playback", new_mode.setting());
+            let _ = db::set_setting(conn, "mpv_path", &new_mpv);
             let _ = db::set_setting(
                 conn,
                 "history_enabled",
@@ -635,6 +876,12 @@ impl App {
         } else {
             Some(draft.api_base.trim().to_string())
         });
+        if new_mode != old_mode || new_mpv != old_mpv {
+            self.player
+                .configure(new_mode, crate::player::executable(&new_mpv));
+            self.attempted = None;
+            self.pending_play = None;
+        }
         self.load_settings_draft();
         self.refresh_sync_status();
         self.trending = Load::Idle;
@@ -722,8 +969,7 @@ impl App {
         }
         let already_playing = self
             .player
-            .now
-            .as_ref()
+            .now()
             .map(|now| now.video_id == card.id)
             .unwrap_or(false);
         if already_playing {
@@ -877,7 +1123,7 @@ impl App {
         if !self.player.is_active() || self.watch_acc < 1.0 {
             return;
         }
-        let Some(now) = self.player.now.clone() else {
+        let Some(now) = self.player.now().cloned() else {
             return;
         };
         let seconds = self.watch_acc.floor() as i64;
@@ -1536,8 +1782,7 @@ impl App {
 
         let playing_this = self
             .player
-            .now
-            .as_ref()
+            .now()
             .map(|now| now.video_id == id)
             .unwrap_or(false);
         let snapshot = self.player.snapshot();
@@ -1557,8 +1802,58 @@ impl App {
                         ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
                     // Once mpv has produced a frame, the video surface replaces
                     // the poster; the paint callback composites it in this rect.
-                    let video_ready = playing_this && snapshot.started;
-                    if video_ready {
+                    let external = self.player.is_external();
+                    let video_ready = !external && playing_this && snapshot.started;
+                    if external {
+                        self.paint_thumb(ui, poster, &id, "maxres");
+                        if playing_this {
+                            ui.painter().rect_filled(
+                                poster,
+                                CornerRadius::same(t::RADIUS),
+                                Color32::from_black_alpha(155),
+                            );
+                            let center = poster.center();
+                            ui.painter().text(
+                                center,
+                                Align2::CENTER_CENTER,
+                                "Playing in MPV",
+                                t::semibold(16.0),
+                                t::TEXT,
+                            );
+                            ui.painter().text(
+                                egui::pos2(center.x, center.y + 24.0),
+                                Align2::CENTER_CENTER,
+                                "Use the mpv window for playback controls",
+                                t::regular(11.5),
+                                t::DIM,
+                            );
+                        } else {
+                            ui.painter().rect_filled(
+                                poster,
+                                CornerRadius::same(t::RADIUS),
+                                Color32::from_black_alpha(70),
+                            );
+                            let center = poster.center();
+                            ui.painter().circle_filled(
+                                center,
+                                30.0,
+                                Color32::from_black_alpha(190),
+                            );
+                            t::paint_icon(
+                                ui.painter(),
+                                Rect::from_center_size(center, Vec2::splat(34.0)),
+                                &t::Icon::Play,
+                                t::TEXT,
+                            );
+                            ui.painter().text(
+                                egui::pos2(center.x, center.y + 46.0),
+                                Align2::CENTER_CENTER,
+                                "Play in MPV",
+                                t::semibold(12.0),
+                                t::TEXT,
+                            );
+                        }
+                    } else if video_ready {
                         ui.painter().rect_filled(
                             poster,
                             CornerRadius::same(t::RADIUS),
@@ -1607,16 +1902,17 @@ impl App {
                     }
 
                     if response.clicked() {
-                        if playing_this {
-                            self.player.toggle_pause();
-                        } else {
+                        if !playing_this {
                             self.start_playback(&card);
+                        } else if !external {
+                            self.player.toggle_pause();
                         }
                     }
 
                     // Transport controls belong with the video now that the
-                    // global bottom bar is gone.
-                    if playing_this {
+                    // global bottom bar is gone. External mode leaves them to
+                    // mpv's own window.
+                    if playing_this && !external {
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             let (kind, label) = if snapshot.paused {
@@ -1684,7 +1980,7 @@ impl App {
                                     t::DIM_2,
                                 );
                                 if let Some(volume) =
-                                    t::volume_slider(ui, self.player.volume as f32)
+                                    t::volume_slider(ui, self.player.volume() as f32)
                                 {
                                     let volume = volume.round() as i32;
                                     self.player.set_volume(volume);
@@ -1759,19 +2055,38 @@ impl App {
                     });
 
                     ui.add_space(10.0);
-                    ui.label(
-                        RichText::new(if playing_this {
-                            if snapshot.paused {
-                                "Paused — click the video to resume"
-                            } else {
-                                "Playing in RustTube"
+                    if external {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(if playing_this {
+                                    "Playing in a separate MPV window"
+                                } else {
+                                    "Press the poster to play in MPV"
+                                })
+                                .size(11.5)
+                                .color(t::DIM_2),
+                            );
+                            if playing_this && t::quiet_button(ui, "Stop playback").clicked() {
+                                self.flush_watch();
+                                self.player.stop();
+                                self.attempted = None;
                             }
-                        } else {
-                            "Press the poster to play"
-                        })
-                        .size(11.5)
-                        .color(t::DIM_2),
-                    );
+                        });
+                    } else {
+                        ui.label(
+                            RichText::new(if playing_this {
+                                if snapshot.paused {
+                                    "Paused — click the video to resume"
+                                } else {
+                                    "Playing in RustTube"
+                                }
+                            } else {
+                                "Press the poster to play"
+                            })
+                            .size(11.5)
+                            .color(t::DIM_2),
+                        );
+                    }
 
                     ui.add_space(12.0);
                     let description = detail
@@ -2155,13 +2470,63 @@ impl App {
 
     fn view_settings(&mut self, ui: &mut Ui) {
         t::h1(ui, "Settings");
-        t::sub(ui, "Video source, cloud sync and local data");
+        t::sub(ui, "Playback, video source, cloud sync and local data");
         ui.add_space(14.0);
 
         ui.allocate_ui_with_layout(
             Vec2::new(ui.available_width().min(820.0), 0.0),
             Layout::top_down(Align::Min),
             |ui| {
+                // Playback
+                t::card_frame().show(ui, |ui| {
+                    ui.label(RichText::new("Playback").size(14.5).strong());
+                    ui.label(
+                        RichText::new(
+                            "Choose whether video is drawn inside RustTube or opened in a separate mpv window.",
+                        )
+                        .size(11.8)
+                        .color(t::DIM_2),
+                    );
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.settings.playback,
+                            "embedded".to_string(),
+                            "Inside RustTube",
+                        );
+                        ui.selectable_value(
+                            &mut self.settings.playback,
+                            "mpv".to_string(),
+                            "Separate MPV window",
+                        );
+                    });
+                    if self.settings.playback == "mpv" {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("mpv executable").size(12.0).color(t::DIM));
+                        let width = ui.available_width();
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.mpv_path)
+                                .hint_text("Automatic (recommended)")
+                                .desired_width(width),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Requires mpv. Leave blank to use a bundled mpv, a Homebrew install, or mpv on PATH. History and resume time still update while MPV plays.",
+                            )
+                            .size(11.0)
+                            .color(t::DIM_2),
+                        );
+                    }
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Changes apply when you save settings.")
+                            .size(11.0)
+                            .color(t::DIM_2),
+                    );
+                });
+
+                ui.add_space(14.0);
+
                 // Video source
                 t::card_frame().show(ui, |ui| {
                     ui.label(RichText::new("Video source").size(14.5).strong());
@@ -2785,7 +3150,7 @@ impl eframe::App for App {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.flush_watch();
-        self.player.stop();
+        self.player.quit();
     }
 }
 

@@ -4,7 +4,6 @@ mod api;
 mod app;
 mod db;
 mod embed;
-#[allow(dead_code)] // process-based player kept as a reference fallback
 mod player;
 mod stream;
 mod sync;

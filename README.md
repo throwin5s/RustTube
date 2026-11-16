@@ -25,20 +25,22 @@ area, and a player bar pinned to the bottom once something is playing.
 | Watch | Poster with play/pause, title, likes, description, related rail |
 | History | Resume points, per-item progress, remove and clear |
 | Statistics | Total/weekly watch time, videos opened, streak, 30-day chart, top channels |
-| Settings | Instance, region, history, cloud sync, local data |
+| Settings | Instance, region, playback window, history, cloud sync, local data |
 
 ## Playback
 
-egui cannot decode video, so RustTube links **libmpv** and renders its frames
-inside the app window through an OpenGL paint callback. There is no separate
-player window and no browser engine: mpv decodes, egui draws the result in the
-watch page, with the same 8px corners as the rest of the interface.
+egui cannot decode video, so by default RustTube links **libmpv** and renders its
+frames inside the app window through an OpenGL paint callback. Settings >
+Playback can instead open the stream in a normal **mpv** window. Both modes use
+mpv for decoding and yt-dlp for resolution; the external mode talks to mpv over
+its IPC socket so history, resume points and watch time keep working.
 
 Starting a video is kept fast deliberately:
 
-- **One long-lived libmpv instance.** It stays alive for the whole session, so
-  loading a video is a single `loadfile` command — no process spawn, no socket
-  handshake. Stopping returns it to idle instead of tearing it down.
+- **One long-lived player.** The embedded libmpv instance stays alive for the
+  whole session, so loading a video is a single `loadfile` command — no process
+  spawn, no socket handshake. External mode likewise keeps one mpv process warm;
+  stopping returns it to idle instead of tearing it down.
 - **One HLS variant, cached.** `src/stream.rs` asks `yt-dlp` for the HLS master
   playlist, then picks the best variant at or below 1080p and hands *that* to
   mpv. Opening one variant instead of the master skips subtitle playlists and
@@ -67,10 +69,12 @@ clickable.
 Requirements:
 
 - Rust 1.85+
-- **libmpv** development files (the in-process player is linked at build time)
+- **libmpv** development files (the embedded player is linked at build time)
   - macOS: `brew install mpv`
   - Windows: a prebuilt libmpv, with `LIBMPV_DIR` pointing at the folder that
     contains `libmpv.dll.a`
+- **mpv** on PATH for Settings > Playback > Separate MPV window (a path can be
+  set there instead; macOS auto-detects Homebrew locations)
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) on `PATH`, or shipped next to the
   binary (`brew install yt-dlp` / `winget install yt-dlp` for development)
 
@@ -137,6 +141,7 @@ src/main.rs    window bootstrap
 src/app.rs     the whole egui interface: routing, views, async message pump
 src/theme.rs   palette, painted icons, cards, progress bar, formatters
 src/embed.rs   libmpv instance, OpenGL FBO renderer, egui paint callback
+src/player.rs  separate mpv process, IPC commands and playback snapshots
 src/stream.rs  yt-dlp stream resolution, memory cache, deduplicated prefetch
 src/api.rs     Invidious + Piped client with per-request instance fallback
 src/db.rs      SQLite schema, watch writes, merge logic

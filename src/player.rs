@@ -11,6 +11,7 @@
 //! resumed, and the UI never blocks. The reader also applies a resume point once
 //! mpv reports the file loaded, because a seek sent before that is dropped.
 
+use crate::embed::{NowPlaying, Snapshot};
 use serde_json::json;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -59,25 +60,6 @@ mod ipc {
 
 use ipc::Stream;
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Snapshot {
-    pub position: f64,
-    pub duration: f64,
-    pub paused: bool,
-    pub ended: bool,
-    /// True once mpv has reported a real playback position.
-    pub started: bool,
-}
-
-#[derive(Clone, Debug)]
-pub struct NowPlaying {
-    pub video_id: String,
-    pub title: String,
-    pub channel_id: String,
-    pub channel_name: String,
-    pub duration_hint: i64,
-}
-
 enum Cmd {
     Load {
         video: String,
@@ -109,12 +91,46 @@ pub struct Player {
     error: Arc<Mutex<Option<String>>>,
     child: Option<Arc<Mutex<Option<Child>>>>,
     endpoint: PathBuf,
+    mpv: PathBuf,
     pub now: Option<NowPlaying>,
     pub volume: i32,
 }
 
+/// Pick the mpv executable to launch. A configured path wins; otherwise try a
+/// player shipped next to RustTube, then the usual Homebrew locations (Finder
+/// apps do not inherit the shell PATH), then plain `mpv` on PATH.
+pub fn executable(configured: &str) -> PathBuf {
+    let configured = configured.trim().trim_matches('"');
+    if !configured.is_empty() {
+        let path = PathBuf::from(configured);
+        if path.is_dir() {
+            return path.join(if cfg!(windows) { "mpv.exe" } else { "mpv" });
+        }
+        return path;
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(if cfg!(windows) { "mpv.exe" } else { "mpv" });
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    for candidate in ["/opt/homebrew/bin/mpv", "/usr/local/bin/mpv"] {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return path;
+        }
+    }
+
+    PathBuf::from("mpv")
+}
+
 impl Player {
-    pub fn new(volume: i32) -> Self {
+    pub fn new(volume: i32, mpv: PathBuf) -> Self {
         Self {
             commands: None,
             snapshot: Arc::new(Mutex::new(Snapshot::default())),
@@ -124,6 +140,7 @@ impl Player {
             error: Arc::new(Mutex::new(None)),
             child: None,
             endpoint: ipc::endpoint(),
+            mpv,
             now: None,
             volume: volume.clamp(0, 130),
         }
@@ -156,6 +173,7 @@ impl Player {
         let endpoint = self.endpoint.clone();
         let writer = tx.clone();
         let volume = self.volume;
+        let mpv = self.mpv.clone();
 
         std::thread::spawn(move || {
             controller(
@@ -169,6 +187,7 @@ impl Player {
                 error,
                 child_handle,
                 volume,
+                mpv,
             )
         });
 
@@ -293,8 +312,10 @@ fn controller(
     error: Arc<Mutex<Option<String>>>,
     child_slot: Arc<Mutex<Option<Child>>>,
     volume: i32,
+    mpv: PathBuf,
 ) {
-    let spawned = Command::new("mpv")
+    let mut command = Command::new(&mpv);
+    command
         .arg("--no-terminal")
         .arg("--really-quiet")
         .arg("--idle=yes")
@@ -308,16 +329,26 @@ fn controller(
         .arg(format!("--input-ipc-server={}", endpoint.display()))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+        .stderr(Stdio::null());
 
-    let child = match spawned {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Keep the console hidden; mpv still opens its own video window.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
             let message = if err.kind() == std::io::ErrorKind::NotFound {
-                "mpv is not installed. Install it with `brew install mpv` or from mpv.io.".to_string()
+                format!(
+                    "mpv was not found ({}). Install mpv or set its path in Settings.",
+                    mpv.display()
+                )
             } else {
-                format!("Could not start mpv: {err}")
+                format!("Could not start {}: {err}", mpv.display())
             };
             set_error(&error, message);
             return;
@@ -367,9 +398,11 @@ fn controller(
             // no audio of their own, so otherwise the file stays silent.
             Cmd::AudioAdd(audio) => vec![json!({ "command": ["audio-add", audio, "select"] })],
             Cmd::SeekTo(target) => vec![json!({ "command": ["seek", target, "absolute"] })],
-            Cmd::Pause(paused) => vec![json!({ "command": ["set_property", "pause", paused] })],
+            Cmd::Pause(paused) => vec![json!({
+                "command": ["set", "pause", if paused { "yes" } else { "no" }]
+            })],
             Cmd::Seek(delta) => vec![json!({ "command": ["seek", delta, "relative"] })],
-            Cmd::Volume(volume) => vec![json!({ "command": ["set_property", "volume", volume] })],
+            Cmd::Volume(volume) => vec![json!({ "command": ["set", "volume", volume] })],
             Cmd::Stop => vec![json!({ "command": ["stop"] })],
             Cmd::Quit => {
                 let _ = writer.write_all(b"{\"command\": [\"quit\"]}\n");
@@ -580,7 +613,7 @@ mod tests {
             .block_on(crate::stream::resolve("dQw4w9WgXcQ"))
             .expect("stream should resolve");
 
-        let mut player = Player::new(25);
+        let mut player = Player::new(25, PathBuf::from("mpv"));
         player
             .begin("dQw4w9WgXcQ", "Test", "UC_test", "Test channel", 213)
             .expect("player should accept the video");
