@@ -548,14 +548,11 @@ fn piped_card_with_id(v: &Value, fallback_id: &str) -> Option<VideoCard> {
         let text = s(v, "uploadedDate");
         if text.is_empty() { relative_date(published_unix) } else { text }
     };
-    let mut duration = v.get("duration").and_then(|x| x.as_i64()).unwrap_or(0);
-    let mut live = duration < 0;
-    if live {
-        duration = 0;
-    }
-    if v.get("livestream").and_then(|x| x.as_bool()).unwrap_or(false) {
-        live = true;
-    }
+    let duration = v.get("duration").and_then(|x| x.as_i64()).unwrap_or(0).max(0);
+    // Piped uses duration -1 for ordinary trending items too; only an explicit
+    // live flag means the item is actually live.
+    let live = v.get("livestream").and_then(|x| x.as_bool()).unwrap_or(false)
+        || v.get("isLive").and_then(|x| x.as_bool()).unwrap_or(false);
     Some(VideoCard {
         thumbnail: thumb(&id, "mq"),
         id,
@@ -745,6 +742,7 @@ mod tests {
             "uploaderName": "Someone",
             "uploaderUrl": "/channel/UC123",
             "duration": -1,
+            "livestream": true,
             "views": 7,
             "uploaded": 1700000000000i64,
             "uploadedDate": "2 days ago"
@@ -795,6 +793,20 @@ mod tests {
         assert_eq!(card.channel_name, "Rick Astley");
         assert_eq!(card.duration, 213);
         assert_eq!(card.channel_id, "UCuAXFkgsw1L7xaCfnd5JJOw");
+    }
+
+    #[test]
+    fn piped_trending_negative_duration_is_not_live() {
+        let raw = serde_json::json!({
+            "url": "/watch?v=dQw4w9WgXcQ",
+            "title": "Regular trending video",
+            "duration": -1,
+            "views": 1000,
+            "uploaderName": "Some Channel"
+        });
+        let card = piped_card_with_id(&raw, "dQw4w9WgXcQ").expect("a card");
+        assert!(!card.live);
+        assert_eq!(card.duration, 0);
     }
 
     #[test]

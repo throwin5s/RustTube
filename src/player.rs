@@ -16,8 +16,10 @@ use serde_json::json;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -71,8 +73,9 @@ enum Cmd {
     LoadYouTube(String),
     SeekTo(f64),
     Pause(bool),
-    Seek(f64),
     Volume(i32),
+    Speed(f64),
+    Mute(bool),
     Stop,
     Quit,
 }
@@ -90,10 +93,15 @@ pub struct Player {
     fallback: Arc<Mutex<Option<String>>>,
     error: Arc<Mutex<Option<String>>>,
     child: Option<Arc<Mutex<Option<Child>>>>,
+    controller: Option<JoinHandle<()>>,
+    /// Cleared when the controller exits, so a dead mpv can be replaced.
+    running: Arc<AtomicBool>,
     endpoint: PathBuf,
     mpv: PathBuf,
     pub now: Option<NowPlaying>,
     pub volume: i32,
+    pub speed: f64,
+    pub muted: bool,
 }
 
 /// Pick the mpv executable to launch. A configured path wins; otherwise try a
@@ -139,11 +147,26 @@ impl Player {
             fallback: Arc::new(Mutex::new(None)),
             error: Arc::new(Mutex::new(None)),
             child: None,
+            controller: None,
+            running: Arc::new(AtomicBool::new(false)),
             endpoint: ipc::endpoint(),
             mpv,
             now: None,
             volume: volume.clamp(0, 130),
+            speed: 1.0,
+            muted: false,
         }
+    }
+
+    fn child_is_alive(&self) -> bool {
+        if let Some(slot) = &self.child {
+            if let Ok(mut guard) = slot.lock() {
+                if let Some(child) = guard.as_mut() {
+                    return matches!(child.try_wait(), Ok(None));
+                }
+            }
+        }
+        false
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -154,11 +177,46 @@ impl Player {
         self.now.is_some()
     }
 
+    /// Stop the controller thread and wait for it to finish shutdown. This
+    /// must complete before a replacement can reuse the same IPC endpoint.
+    fn stop_controller(&mut self) {
+        if let Some(tx) = self.commands.take() {
+            let _ = tx.send(Cmd::Quit);
+        }
+        if let Some(slot) = &self.child {
+            if let Ok(mut guard) = slot.lock() {
+                if let Some(child) = guard.as_mut() {
+                    let _ = child.kill();
+                }
+            }
+        }
+        if let Some(handle) = self.controller.take() {
+            let _ = handle.join();
+        }
+        // If the controller exited before its shutdown path took the child,
+        // reap it here so nothing is left behind.
+        if let Some(slot) = self.child.take() {
+            if let Ok(mut guard) = slot.lock() {
+                if let Some(mut child) = guard.take() {
+                    let _ = child.wait();
+                }
+            }
+        }
+        self.running.store(false, Ordering::SeqCst);
+    }
+
     /// Start mpv once, in the background, and keep it idle between videos.
     /// Called at launch so the first click never pays process startup.
     pub fn warm(&mut self) {
         if self.commands.is_some() {
-            return;
+            // A child that is still spawning counts as running; once it is
+            // gone (window closed or crash), retire the old controller before
+            // spawning its replacement.
+            let starting = self.child.is_none() && self.running.load(Ordering::SeqCst);
+            if self.child_is_alive() || starting {
+                return;
+            }
+            self.stop_controller();
         }
         ipc::cleanup(&self.endpoint);
 
@@ -174,8 +232,10 @@ impl Player {
         let writer = tx.clone();
         let volume = self.volume;
         let mpv = self.mpv.clone();
+        let running = Arc::clone(&self.running);
+        running.store(true, Ordering::SeqCst);
 
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             controller(
                 endpoint,
                 rx,
@@ -188,11 +248,19 @@ impl Player {
                 child_handle,
                 volume,
                 mpv,
-            )
+            );
+            running.store(false, Ordering::SeqCst);
         });
 
         self.child = Some(child);
+        self.controller = Some(handle);
         self.commands = Some(tx);
+        // Queue the current playback preferences so a fresh mpv starts with
+        // the same speed and mute state as the previous one.
+        if let Some(tx) = &self.commands {
+            let _ = tx.send(Cmd::Speed(self.speed));
+            let _ = tx.send(Cmd::Mute(self.muted));
+        }
     }
 
     /// Mark a video as the one playing, before its URL is known. The player bar
@@ -229,7 +297,11 @@ impl Player {
     /// once mpv reports the file loaded, which is the only safe moment for both.
     pub fn load(&mut self, video: &str, audio: Option<&str>, video_id: &str, start_at: f64) {
         if let Ok(mut resume) = self.resume.lock() {
-            *resume = if start_at > 5.0 { Some(start_at) } else { None };
+            *resume = if start_at >= 5.0 {
+                Some(start_at)
+            } else {
+                None
+            };
         }
         if let Ok(mut pending) = self.pending_audio.lock() {
             *pending = audio.map(str::to_string);
@@ -244,16 +316,33 @@ impl Player {
 
     pub fn toggle_pause(&mut self) {
         let paused = self.snapshot().paused;
-        self.send(Cmd::Pause(!paused));
+        self.set_paused(!paused);
     }
 
-    pub fn seek(&mut self, seconds: f64) {
-        self.send(Cmd::Seek(seconds));
+    pub fn set_paused(&mut self, paused: bool) {
+        if let Ok(mut snapshot) = self.snapshot.lock() {
+            snapshot.paused = paused;
+        }
+        self.send(Cmd::Pause(paused));
+    }
+
+    pub fn seek_to(&mut self, seconds: f64) {
+        self.send(Cmd::SeekTo(seconds));
     }
 
     pub fn set_volume(&mut self, volume: i32) {
         self.volume = volume.clamp(0, 130);
         self.send(Cmd::Volume(self.volume));
+    }
+
+    pub fn set_speed(&mut self, speed: f64) {
+        self.speed = speed.clamp(0.25, 4.0);
+        self.send(Cmd::Speed(self.speed));
+    }
+
+    pub fn set_muted(&mut self, muted: bool) {
+        self.muted = muted;
+        self.send(Cmd::Mute(muted));
     }
 
     fn send(&mut self, command: Cmd) {
@@ -277,19 +366,7 @@ impl Player {
 
     pub fn quit(&mut self) {
         self.now = None;
-        if let Some(tx) = self.commands.take() {
-            let _ = tx.send(Cmd::Quit);
-        }
-        // Also kill directly: if the controller is still waiting for the socket,
-        // it would otherwise leave an orphaned mpv behind.
-        if let Some(slot) = self.child.take() {
-            if let Ok(mut guard) = slot.lock() {
-                if let Some(mut child) = guard.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-            }
-        }
+        self.stop_controller();
         ipc::cleanup(&self.endpoint);
     }
 }
@@ -297,6 +374,33 @@ impl Player {
 impl Drop for Player {
     fn drop(&mut self) {
         self.quit();
+    }
+}
+
+/// Everything the controller sends to external mpv for one command. Kept
+/// separate from the socket loop so the exact URLs and property writes can be
+/// tested without launching a process.
+fn command_payloads(command: &Cmd) -> Vec<serde_json::Value> {
+    match command {
+        Cmd::Load { video } | Cmd::LoadYouTube(video) => {
+            vec![json!({ "command": ["loadfile", video, "replace"] })]
+        }
+        // `select` makes the external track current; HLS video variants carry
+        // no audio of their own, so otherwise the file stays silent.
+        Cmd::AudioAdd(audio) => vec![json!({ "command": ["audio-add", audio, "select"] })],
+        Cmd::SeekTo(target) => vec![json!({ "command": ["seek", target, "absolute"] })],
+        Cmd::Pause(paused) => vec![json!({
+            "command": ["set", "pause", if *paused { "yes" } else { "no" }]
+        })],
+        // Numeric properties must use `set_property`; the shorthand `set`
+        // expects a string and rejects a JSON number such as 1.5.
+        Cmd::Volume(volume) => vec![json!({"command": ["set_property", "volume", volume]})],
+        Cmd::Speed(speed) => vec![json!({"command": ["set_property", "speed", speed]})],
+        Cmd::Mute(muted) => vec![json!({
+            "command": ["set", "mute", if *muted { "yes" } else { "no" }]
+        })],
+        Cmd::Stop => vec![json!({ "command": ["stop"] })],
+        Cmd::Quit => vec![json!({ "command": ["quit"] })],
     }
 }
 
@@ -390,32 +494,15 @@ fn controller(
     }
 
     while let Ok(command) = commands.recv() {
-        let payloads: Vec<serde_json::Value> = match command {
-            Cmd::Load { video } | Cmd::LoadYouTube(video) => {
-                vec![json!({ "command": ["loadfile", video, "replace"] })]
-            }
-            // `select` makes the external track current; HLS video variants carry
-            // no audio of their own, so otherwise the file stays silent.
-            Cmd::AudioAdd(audio) => vec![json!({ "command": ["audio-add", audio, "select"] })],
-            Cmd::SeekTo(target) => vec![json!({ "command": ["seek", target, "absolute"] })],
-            Cmd::Pause(paused) => vec![json!({
-                "command": ["set", "pause", if paused { "yes" } else { "no" }]
-            })],
-            Cmd::Seek(delta) => vec![json!({ "command": ["seek", delta, "relative"] })],
-            Cmd::Volume(volume) => vec![json!({ "command": ["set", "volume", volume] })],
-            Cmd::Stop => vec![json!({ "command": ["stop"] })],
-            Cmd::Quit => {
-                let _ = writer.write_all(b"{\"command\": [\"quit\"]}\n");
-                break;
-            }
-        };
+        if matches!(&command, Cmd::Quit) {
+            let _ = writer.write_all(b"{\"command\": [\"quit\"]}\n");
+            break;
+        }
+        let payloads = command_payloads(&command);
 
         let mut failed = false;
         for payload in payloads {
-            if writer
-                .write_all(format!("{payload}\n").as_bytes())
-                .is_err()
-            {
+            if writer.write_all(format!("{payload}\n").as_bytes()).is_err() {
                 failed = true;
                 break;
             }
@@ -435,10 +522,7 @@ fn set_error(error: &Arc<Mutex<Option<String>>>, message: String) {
     }
 }
 
-fn wait_for_socket(
-    endpoint: &PathBuf,
-    child_slot: &Arc<Mutex<Option<Child>>>,
-) -> Option<Stream> {
+fn wait_for_socket(endpoint: &PathBuf, child_slot: &Arc<Mutex<Option<Child>>>) -> Option<Stream> {
     for _ in 0..120 {
         if let Ok(stream) = ipc::connect(endpoint) {
             return Some(stream);
@@ -480,7 +564,12 @@ fn reader_loop(
         Ok(reader) => reader,
         Err(_) => return,
     };
-    for (id, name) in [(1, "time-pos"), (2, "duration"), (3, "pause"), (4, "eof-reached")] {
+    for (id, name) in [
+        (1, "time-pos"),
+        (2, "duration"),
+        (3, "pause"),
+        (4, "eof-reached"),
+    ] {
         let command = json!({ "command": ["observe_property", id, name] });
         if reader.write_all(format!("{command}\n").as_bytes()).is_err() {
             return;
@@ -603,6 +692,207 @@ fn apply_event(
 mod tests {
     use super::*;
 
+    fn wait_for_live_child(player: &Player) -> Option<u32> {
+        for _ in 0..100 {
+            if let Some(slot) = &player.child {
+                if let Ok(mut guard) = slot.lock() {
+                    if let Some(child) = guard.as_mut() {
+                        if matches!(child.try_wait(), Ok(None)) {
+                            return Some(child.id());
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+
+    #[test]
+    fn external_payloads_use_quality_url_and_playback_controls() {
+        let master = "https://host/master.m3u8";
+        let playlist = "\
+#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
+360/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720
+720/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080
+1080/index.m3u8
+";
+        let selected = crate::stream::pick_variant_url(master, playlist, 720)
+            .expect("720p variant should be selected");
+        assert_eq!(selected, "https://host/720/index.m3u8");
+        assert_eq!(
+            command_payloads(&Cmd::Load {
+                video: selected.clone()
+            }),
+            vec![json!({"command": ["loadfile", selected, "replace"]})]
+        );
+        assert_eq!(
+            command_payloads(&Cmd::Speed(1.5)),
+            vec![json!({"command": ["set_property", "speed", 1.5]})]
+        );
+        assert_eq!(
+            command_payloads(&Cmd::Volume(85)),
+            vec![json!({"command": ["set_property", "volume", 85]})]
+        );
+        assert_eq!(
+            command_payloads(&Cmd::Mute(true)),
+            vec![json!({"command": ["set", "mute", "yes"]})]
+        );
+        assert_eq!(
+            command_payloads(&Cmd::Mute(false)),
+            vec![json!({"command": ["set", "mute", "no"]})]
+        );
+    }
+
+    #[test]
+    fn external_player_queues_selected_quality_url_and_controls() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut player = Player::new(0, PathBuf::from("mpv"));
+        player.commands = Some(tx);
+        let selected = "https://host/720/index.m3u8";
+        player.load(selected, None, "video", 0.0);
+        player.set_speed(1.5);
+        player.set_muted(true);
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Cmd::Load { video }) if video == selected
+        ));
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Speed(speed)) if speed == 1.5));
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Mute(true))));
+    }
+
+    #[cfg(unix)]
+    fn external_property(player: &Player, name: &str) -> serde_json::Value {
+        use std::io::BufRead;
+
+        let mut stream = None;
+        for _ in 0..100 {
+            if let Ok(candidate) = ipc::connect(&player.endpoint) {
+                stream = Some(candidate);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut stream = stream.expect("external mpv control socket should open");
+        stream
+            .write_all(format!("{{\"command\":[\"get_property\",\"{name}\"]}}\n").as_bytes())
+            .expect("write property query");
+        let mut reader = std::io::BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            let read = reader.read_line(&mut line).expect("read property response");
+            assert!(read > 0, "mpv closed before answering {name}");
+            let value: serde_json::Value =
+                serde_json::from_str(line.trim()).expect("property response is JSON");
+            if let Some(data) = value.get("data") {
+                return data.clone();
+            }
+            if let Some(error) = value.get("error").and_then(|error| error.as_str()) {
+                assert_eq!(error, "success", "mpv rejected get_property {name}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn silent_wav() -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("rusttube-external-{}.wav", std::process::id()));
+        let sample_rate = 8_000u32;
+        let samples = sample_rate * 4;
+        let data_len = samples * 2;
+        let mut bytes = Vec::with_capacity((44 + data_len) as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        bytes.resize((44 + data_len) as usize, 0);
+        std::fs::write(&path, bytes).expect("write silent wav");
+        path
+    }
+
+    #[test]
+    #[ignore = "launches a real external mpv process"]
+    #[cfg(unix)]
+    fn external_mpv_applies_speed_and_mute() {
+        let mut player = Player::new(0, executable(""));
+        let wav = silent_wav();
+        player
+            .begin("test", "Test", "UC_test", "Test channel", 4)
+            .expect("player should accept the video");
+        player.load(wav.to_str().expect("wav path"), None, "test", 0.0);
+
+        let loaded = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < loaded && !player.snapshot().started {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            player.snapshot().started,
+            "external mpv never loaded the local test media"
+        );
+        player.set_speed(1.5);
+        player.set_muted(true);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut speed = serde_json::Value::Null;
+        let mut mute = serde_json::Value::Null;
+        while std::time::Instant::now() < deadline {
+            speed = external_property(&player, "speed");
+            mute = external_property(&player, "mute");
+            if speed.as_f64() == Some(1.5) && mute.as_bool() == Some(true) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        println!("external properties before quit: speed={speed} mute={mute}");
+        player.quit();
+        let _ = std::fs::remove_file(&wav);
+
+        assert_eq!(
+            speed.as_f64(),
+            Some(1.5),
+            "external mpv speed was not applied"
+        );
+        assert_eq!(
+            mute.as_bool(),
+            Some(true),
+            "external mpv mute was not applied"
+        );
+        println!("external mpv applied speed={speed} mute={mute}");
+    }
+
+    #[test]
+    #[ignore = "launches mpv"]
+    fn warm_replaces_an_exited_mpv_process() {
+        let mut player = Player::new(0, executable(""));
+        player.warm();
+        let first = wait_for_live_child(&player).expect("mpv should start");
+
+        {
+            let slot = player.child.as_ref().expect("child slot");
+            let mut guard = slot.lock().expect("child lock");
+            let child = guard.as_mut().expect("mpv child");
+            child.kill().expect("kill mpv");
+            let _ = child.wait();
+        }
+
+        player.warm();
+        let second = wait_for_live_child(&player).expect("mpv should restart");
+        assert_ne!(first, second, "warm must launch a replacement process");
+        player.quit();
+    }
+
     /// Real playback check: resolves the stream, loads it into the warm player,
     /// and asserts both that the position advances and that it starts quickly.
     #[test]
@@ -610,7 +900,10 @@ mod tests {
     fn mpv_plays_a_video_quickly() {
         let stream = tokio::runtime::Runtime::new()
             .expect("runtime")
-            .block_on(crate::stream::resolve("dQw4w9WgXcQ"))
+            .block_on(crate::stream::resolve(
+                "dQw4w9WgXcQ",
+                crate::stream::DEFAULT_MAX_HEIGHT,
+            ))
             .expect("stream should resolve");
 
         let mut player = Player::new(25, PathBuf::from("mpv"));

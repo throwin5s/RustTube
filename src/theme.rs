@@ -13,6 +13,7 @@ use eframe::egui::{
     Response, RichText, Sense, Stroke, TextStyle, Ui, Vec2,
 };
 use std::sync::Arc;
+use std::time::Duration;
 
 // ------------------------------------------------------------------- palette
 
@@ -34,7 +35,6 @@ pub const TEXT: Color32 = Color32::from_rgb(0xf2, 0xf4, 0xf6);
 pub const DIM: Color32 = Color32::from_rgb(0xa9, 0xb1, 0xbc);
 pub const DIM_2: Color32 = Color32::from_rgb(0x6e, 0x77, 0x84);
 pub const DANGER: Color32 = Color32::from_rgb(0xf5, 0x71, 0x7f);
-pub const OK: Color32 = Color32::from_rgb(0x1e, 0xd7, 0x60);
 
 // ------------------------------------------------------------------- metrics
 
@@ -132,10 +132,52 @@ pub fn apply(ctx: &egui::Context) {
     scroll.bar_width = 8.0;
     scroll.floating_width = 6.0;
     scroll.handle_min_length = 28.0;
+    set_scrollbar_opacity(&mut scroll, 0.0);
     style.spacing.scroll = scroll;
 
     style.animation_time = 0.12;
     ctx.set_style(style);
+}
+
+/// Reveal scrollbars only while the user is actively scrolling, then let them
+/// disappear again. egui's floating style normally fades one in whenever the
+/// pointer enters the scroll area, which leaves the bar visible while merely
+/// reading or moving across a page.
+pub fn update_scrollbars(ctx: &egui::Context) {
+    // Hold the bar just long enough to read as responsive after the last scroll,
+    // then ease it out rather than snapping it away.
+    const VISIBLE_FOR: f32 = 0.35;
+    const FADE_OUT: f32 = 0.25;
+
+    let since_scroll = ctx.input(|input| input.time_since_last_scroll());
+    let fade = ((since_scroll - VISIBLE_FOR) / FADE_OUT).clamp(0.0, 1.0);
+    // Smoothstep, so there is no visible step where the hold ends or the fade
+    // finishes.
+    let eased = fade * fade * (3.0 - 2.0 * fade);
+    let alpha = 1.0 - eased;
+
+    ctx.style_mut(|style| set_scrollbar_opacity(&mut style.spacing.scroll, alpha));
+
+    if fade >= 1.0 {
+        return;
+    }
+    if fade > 0.0 {
+        // Animation frames while the bar is fading out.
+        ctx.request_repaint_after(Duration::from_millis(16));
+    } else {
+        // Asleep while the bar is held, wake once to start the fade.
+        ctx.request_repaint_after(Duration::from_secs_f32(VISIBLE_FOR - since_scroll));
+    }
+}
+
+fn set_scrollbar_opacity(scroll: &mut egui::style::ScrollStyle, alpha: f32) {
+    let (background, handle) = (0.4 * alpha, 0.6 * alpha);
+    scroll.dormant_background_opacity = 0.0;
+    scroll.dormant_handle_opacity = 0.0;
+    scroll.active_background_opacity = background;
+    scroll.active_handle_opacity = handle;
+    scroll.interact_background_opacity = background;
+    scroll.interact_handle_opacity = handle;
 }
 
 fn visuals() -> egui::Visuals {
@@ -220,6 +262,7 @@ pub fn accent_button(ui: &mut Ui, label: &str) -> Response {
             .stroke(Stroke::NONE)
             .corner_radius(CornerRadius::same(RADIUS)),
     )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Outlined button, the secondary action beside an accent one.
@@ -230,6 +273,7 @@ pub fn quiet_button(ui: &mut Ui, label: &str) -> Response {
             .stroke(Stroke::new(1.0_f32, LINE))
             .corner_radius(CornerRadius::same(RADIUS)),
     )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 pub fn danger_button(ui: &mut Ui, label: &str) -> Response {
@@ -239,6 +283,7 @@ pub fn danger_button(ui: &mut Ui, label: &str) -> Response {
             .stroke(Stroke::new(1.0_f32, DANGER.gamma_multiply(0.6)))
             .corner_radius(CornerRadius::same(RADIUS)),
     )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Sidebar navigation row: rounded fill on hover, filled when active.
@@ -265,7 +310,7 @@ pub fn nav_row(ui: &mut Ui, label: &str, active: bool) -> Response {
         },
         if active || hovered { TEXT } else { DIM },
     );
-    response
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 // --------------------------------------------------------------------- icons
@@ -275,7 +320,10 @@ pub enum Icon {
     Play,
     Pause,
     Back,
+    Forward,
+    Sidebar,
     Volume,
+    VolumeMuted,
 }
 
 pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32) -> Response {
@@ -286,7 +334,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32) -> Response {
             .circle_filled(rect.center(), size * 0.46, PANEL_3);
     }
     paint_icon(ui.painter(), rect, &icon, color);
-    response
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: &Icon, color: Color32) {
@@ -324,7 +372,29 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: &Icon, color: Color
                 Stroke::new(1.8_f32, color),
             ));
         }
-        Icon::Volume => {
+        Icon::Forward => {
+            painter.add(egui::Shape::line(
+                vec![
+                    egui::pos2(c.x - s * 0.25, c.y - s * 0.4),
+                    egui::pos2(c.x + s * 0.25, c.y),
+                    egui::pos2(c.x - s * 0.25, c.y + s * 0.4),
+                ],
+                Stroke::new(1.8_f32, color),
+            ));
+        }
+        Icon::Sidebar => {
+            for offset in [-0.32, 0.0, 0.32] {
+                painter.rect_filled(
+                    Rect::from_min_size(
+                        egui::pos2(c.x - s * 0.36, c.y + s * offset - s * 0.05),
+                        Vec2::new(s * 0.72, s * 0.1),
+                    ),
+                    CornerRadius::same(1),
+                    color,
+                );
+            }
+        }
+        Icon::Volume | Icon::VolumeMuted => {
             painter.rect_filled(
                 Rect::from_center_size(
                     egui::pos2(c.x - s * 0.26, c.y),
@@ -343,20 +413,37 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: &Icon, color: Color
                 color,
                 Stroke::NONE,
             ));
-            painter.add(egui::Shape::line(
-                vec![
-                    egui::pos2(c.x + s * 0.28, c.y - s * 0.14),
-                    egui::pos2(c.x + s * 0.28, c.y + s * 0.14),
-                ],
-                Stroke::new(1.4_f32, color),
-            ));
-            painter.add(egui::Shape::line(
-                vec![
-                    egui::pos2(c.x + s * 0.42, c.y - s * 0.28),
-                    egui::pos2(c.x + s * 0.42, c.y + s * 0.28),
-                ],
-                Stroke::new(1.4_f32, color),
-            ));
+            if matches!(icon, Icon::VolumeMuted) {
+                painter.add(egui::Shape::line(
+                    vec![
+                        egui::pos2(c.x + s * 0.22, c.y - s * 0.22),
+                        egui::pos2(c.x + s * 0.48, c.y + s * 0.22),
+                    ],
+                    Stroke::new(1.8_f32, color),
+                ));
+                painter.add(egui::Shape::line(
+                    vec![
+                        egui::pos2(c.x + s * 0.48, c.y - s * 0.22),
+                        egui::pos2(c.x + s * 0.22, c.y + s * 0.22),
+                    ],
+                    Stroke::new(1.8_f32, color),
+                ));
+            } else {
+                painter.add(egui::Shape::line(
+                    vec![
+                        egui::pos2(c.x + s * 0.28, c.y - s * 0.14),
+                        egui::pos2(c.x + s * 0.28, c.y + s * 0.14),
+                    ],
+                    Stroke::new(1.4_f32, color),
+                ));
+                painter.add(egui::Shape::line(
+                    vec![
+                        egui::pos2(c.x + s * 0.42, c.y - s * 0.28),
+                        egui::pos2(c.x + s * 0.42, c.y + s * 0.28),
+                    ],
+                    Stroke::new(1.4_f32, color),
+                ));
+            }
         }
     }
 }
@@ -372,51 +459,70 @@ pub fn placeholder_thumbnail(painter: &egui::Painter, rect: Rect) {
     );
 }
 
-/// Progress bar with rounded ends; returns a clickable response so callers can seek.
-pub fn progress(ui: &mut Ui, fraction: f32, height: f32, hovered_fill: Color32) -> (Response, Rect) {
+/// Progress bar with rounded ends. Returns the response, track, and the target
+/// fraction while the user is pressing or dragging, so callers can seek to an
+/// absolute position instead of accumulating relative seeks.
+pub fn progress(
+    ui: &mut Ui,
+    fraction: f32,
+    height: f32,
+    hovered_fill: Color32,
+) -> (Response, Rect, Option<f32>) {
     let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height * 3.0), Sense::click());
-    let line = Rect::from_center_size(rect.center(), Vec2::new(width, height));
-    let radius = CornerRadius::same(RADIUS);
+    let thickness = height.max(6.0);
+    // Give the bar a generous invisible hit area so it is easy to grab.
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click_and_drag());
+    let line = Rect::from_center_size(rect.center(), Vec2::new(width, thickness));
+    let target = response.interact_pointer_pos().and_then(|pos| {
+        (width > 0.0).then(|| ((pos.x - line.left()) / width).clamp(0.0, 1.0))
+    });
+    let shown = target.unwrap_or(fraction).clamp(0.0, 1.0);
+    let radius = CornerRadius::same((thickness * 0.5).round() as u8);
     ui.painter().rect_filled(line, radius, PANEL_3);
-    let filled = Rect::from_min_size(
-        line.min,
-        Vec2::new(width * fraction.clamp(0.0, 1.0), height),
-    );
-    if fraction > 0.0 {
+    let filled = Rect::from_min_size(line.min, Vec2::new(width * shown, thickness));
+    if shown > 0.0 {
         ui.painter().rect_filled(filled, radius, hovered_fill);
     }
-    if response.hovered() {
-        let knob = Rect::from_center_size(
-            egui::pos2(filled.right().max(line.left() + 3.0), line.center().y),
-            Vec2::splat(height * 1.9),
-        );
-        ui.painter()
-            .circle_filled(knob.center(), height * 0.95, TEXT);
-    }
-    (response, line)
+    let knob_radius = if response.hovered() || response.dragged() {
+        7.0
+    } else {
+        5.0
+    };
+    ui.painter().circle_filled(
+        egui::pos2(
+            filled.right().max(line.left() + thickness * 0.5),
+            line.center().y,
+        ),
+        knob_radius,
+        TEXT,
+    );
+    (
+        response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal),
+        line,
+        target,
+    )
 }
 
 /// Compact volume control drawn in the same visual language as the seek bar.
 /// Returns the new 0–130 value while the user clicks or drags it.
 pub fn volume_slider(ui: &mut Ui, value: f32) -> Option<f32> {
-    let width = 96.0;
+    let width = 140.0;
     let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(width, 18.0), Sense::click_and_drag());
-    let line = Rect::from_center_size(rect.center(), Vec2::new(width, 5.0));
-    let radius = CornerRadius::same(RADIUS);
+        ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click_and_drag());
+    let line = Rect::from_center_size(rect.center(), Vec2::new(width, 8.0));
+    let radius = CornerRadius::same(4);
     ui.painter().rect_filled(line, radius, PANEL_3);
     let fraction = (value / 130.0).clamp(0.0, 1.0);
-    let filled = Rect::from_min_size(line.min, Vec2::new(width * fraction, 5.0));
+    let filled = Rect::from_min_size(line.min, Vec2::new(width * fraction, 8.0));
     if fraction > 0.0 {
         ui.painter().rect_filled(filled, radius, ACCENT);
     }
     ui.painter().circle_filled(
         egui::pos2(line.left() + width * fraction, line.center().y),
         if response.hovered() || response.dragged() {
-            4.5
+            7.0
         } else {
-            3.2
+            5.0
         },
         TEXT,
     );

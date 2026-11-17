@@ -12,6 +12,7 @@ use eframe::glow::{self, HasContext};
 use egui_glow::CallbackFn;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 // --------------------------------------------------------------------- FFI
@@ -96,6 +97,7 @@ extern "C" {
         mpv: Handle,
         params: *mut MpvRenderParam,
     ) -> c_int;
+    fn mpv_render_context_update(ctx: RenderCtx) -> c_int;
     fn mpv_render_context_render(ctx: RenderCtx, params: *mut MpvRenderParam) -> c_int;
     fn mpv_render_context_report_swap(ctx: RenderCtx);
     fn mpv_render_context_set_update_callback(
@@ -219,6 +221,8 @@ struct GlState {
     size: (i32, i32),
     size_uniform: Option<glow::UniformLocation>,
     radius_uniform: Option<glow::UniformLocation>,
+    clip_pos_uniform: Option<glow::UniformLocation>,
+    clip_size_uniform: Option<glow::UniformLocation>,
 }
 
 struct RenderState {
@@ -232,6 +236,7 @@ unsafe impl Sync for RenderState {}
 struct Inner {
     mpv: Handle,
     render: Mutex<RenderState>,
+    frame_ready: AtomicBool,
     snapshot: Mutex<Snapshot>,
     pending_audio: Mutex<Option<String>>,
     resume: Mutex<Option<f64>>,
@@ -274,16 +279,33 @@ impl Inner {
 pub struct Player {
     inner: Option<Arc<Inner>>,
     pub volume: i32,
+    pub speed: f64,
+    pub muted: bool,
     pub now: Option<NowPlaying>,
 }
 
 impl Player {
     pub fn new(volume: i32, ctx: egui::Context) -> Self {
         let volume = volume.clamp(0, 130);
-        let inner = Inner::start(volume, ctx);
+        let inner = Inner::start(volume, ctx, false);
         Self {
             inner,
             volume,
+            speed: 1.0,
+            muted: false,
+            now: None,
+        }
+    }
+
+    /// A muted, looping renderer for the thumbnail hover preview. It is a
+    /// separate mpv instance so it never interferes with the selected video.
+    pub fn new_preview(ctx: egui::Context) -> Self {
+        let inner = Inner::start(0, ctx, true);
+        Self {
+            inner,
+            volume: 0,
+            speed: 1.0,
+            muted: true,
             now: None,
         }
     }
@@ -297,6 +319,13 @@ impl Player {
             .as_ref()
             .and_then(|inner| inner.snapshot.lock().ok().map(|s| *s))
             .unwrap_or_default()
+    }
+
+    pub fn has_rendered_frame(&self) -> bool {
+        self.inner
+            .as_ref()
+            .map(|inner| inner.frame_ready.load(Ordering::Relaxed))
+            .unwrap_or(false)
     }
 
     pub fn is_active(&self) -> bool {
@@ -326,11 +355,12 @@ impl Player {
 
     pub fn load(&mut self, video: &str, audio: Option<&str>, video_id: &str, start_at: f64) {
         let Some(inner) = &self.inner else { return };
+        inner.frame_ready.store(false, Ordering::Relaxed);
         if let Ok(mut snapshot) = inner.snapshot.lock() {
             *snapshot = Snapshot::default();
         }
         if let Ok(mut resume) = inner.resume.lock() {
-            *resume = if start_at > 5.0 { Some(start_at) } else { None };
+            *resume = if start_at >= 5.0 { Some(start_at) } else { None };
         }
         if let Ok(mut pending) = inner.pending_audio.lock() {
             *pending = audio.map(str::to_string);
@@ -338,23 +368,36 @@ impl Player {
         if let Ok(mut fallback) = inner.fallback.lock() {
             *fallback = Some(format!("https://www.youtube.com/watch?v={video_id}"));
         }
+        let speed = self.speed.to_string();
+        inner.command(&["set", "speed", &speed]);
+        inner.command(&["set", "mute", if self.muted { "yes" } else { "no" }]);
         inner.command(&["loadfile", video, "replace"]);
     }
 
     pub fn toggle_pause(&mut self) {
-        let paused = self.snapshot().paused;
+        self.set_paused(!self.snapshot().paused);
+    }
+
+    pub fn set_paused(&mut self, paused: bool) {
         if let Some(inner) = &self.inner {
+            // Keep the local view in sync immediately. After a reload the
+            // snapshot is reset, and re-pausing an already paused stream emits
+            // no mpv property change, so waiting for the event would leave the
+            // overlay showing the wrong transport icon.
+            if let Ok(mut snapshot) = inner.snapshot.lock() {
+                snapshot.paused = paused;
+            }
             // mpv's command is `set` (there is no `set_property` command;
             // that is only the C API name). Calling the wrong one failed
             // silently, which made pause and volume look dead.
-            inner.command(&["set", "pause", if paused { "no" } else { "yes" }]);
+            inner.command(&["set", "pause", if paused { "yes" } else { "no" }]);
         }
     }
 
-    pub fn seek(&mut self, seconds: f64) {
+    pub fn seek_to(&mut self, seconds: f64) {
         if let Some(inner) = &self.inner {
-            let delta = format!("{seconds}");
-            inner.command(&["seek", &delta, "relative"]);
+            let target = format!("{seconds}");
+            inner.command(&["seek", &target, "absolute"]);
         }
     }
 
@@ -366,10 +409,26 @@ impl Player {
         }
     }
 
+    pub fn set_speed(&mut self, speed: f64) {
+        self.speed = speed.clamp(0.25, 4.0);
+        if let Some(inner) = &self.inner {
+            let value = self.speed.to_string();
+            inner.command(&["set", "speed", &value]);
+        }
+    }
+
+    pub fn set_muted(&mut self, muted: bool) {
+        self.muted = muted;
+        if let Some(inner) = &self.inner {
+            inner.command(&["set", "mute", if muted { "yes" } else { "no" }]);
+        }
+    }
+
     pub fn stop(&mut self) {
         self.now = None;
         if let Some(inner) = &self.inner {
             inner.command(&["stop"]);
+            inner.frame_ready.store(false, Ordering::Relaxed);
             if let Ok(mut snapshot) = inner.snapshot.lock() {
                 *snapshot = Snapshot::default();
             }
@@ -414,7 +473,7 @@ impl Drop for Player {
 // ------------------------------------------------------------------- setup
 
 impl Inner {
-    fn start(volume: i32, ctx: egui::Context) -> Option<Arc<Inner>> {
+    fn start(volume: i32, ctx: egui::Context, preview: bool) -> Option<Arc<Inner>> {
         let mpv = unsafe { mpv_create() };
         if mpv.is_null() {
             return None;
@@ -425,6 +484,7 @@ impl Inner {
                 ctx: ptr::null_mut(),
                 gl: GlState::default(),
             }),
+            frame_ready: AtomicBool::new(false),
             snapshot: Mutex::new(Snapshot::default()),
             pending_audio: Mutex::new(None),
             resume: Mutex::new(None),
@@ -440,6 +500,11 @@ impl Inner {
         inner.set_option("audio-display", "no");
         inner.set_option("ytdl-format", "bv*[height<=?1080]+ba/b[height<=?1080]");
         inner.set_option("volume", &volume.to_string());
+        if preview {
+            inner.set_option("mute", "yes");
+            inner.set_option("aid", "no");
+            inner.set_option("loop-file", "inf");
+        }
         if unsafe { mpv_initialize(mpv) } < 0 {
             return None;
         }
@@ -496,6 +561,9 @@ impl Inner {
                     self.on_property(&name, property);
                 }
                 MPV_EVENT_FILE_LOADED => {
+                    if let Ok(mut snapshot) = self.snapshot.lock() {
+                        snapshot.started = false;
+                    }
                     let audio = self
                         .pending_audio
                         .lock()
@@ -573,11 +641,29 @@ impl Inner {
     }
 
     fn draw(&self, gl: &Arc<glow::Context>, info: egui::PaintCallbackInfo) {
-        let viewport = info.viewport_in_pixels();
-        let (width, height) = (viewport.width_px, viewport.height_px);
+        // Render the whole video even when scrolling clips part of it. Using
+        // the clipped viewport here shrank the render target and made the
+        // picture look cut off as it moved behind the scroll edge.
+        let ppp = info.pixels_per_point;
+        let screen_height = info.screen_size_px[1] as i32;
+        let full_left = (info.viewport.min.x * ppp).round() as i32;
+        let full_top = (info.viewport.min.y * ppp).round() as i32;
+        let full_right = (info.viewport.max.x * ppp).round() as i32;
+        let full_bottom = (info.viewport.max.y * ppp).round() as i32;
+        let (width, height) = (full_right - full_left, full_bottom - full_top);
         if width <= 0 || height <= 0 {
             return;
         }
+        let clip_rect = info.clip_rect.intersect(info.viewport);
+        let clip_left = (clip_rect.min.x * ppp).round() as i32;
+        let clip_top = (clip_rect.min.y * ppp).round() as i32;
+        let clip_right = (clip_rect.max.x * ppp).round() as i32;
+        let clip_bottom = (clip_rect.max.y * ppp).round() as i32;
+        let (clip_width, clip_height) = (clip_right - clip_left, clip_bottom - clip_top);
+        if clip_width <= 0 || clip_height <= 0 {
+            return;
+        }
+        let clip_from_bottom = screen_height - clip_bottom;
         let Ok(mut state) = self.render.lock() else {
             return;
         };
@@ -592,6 +678,14 @@ impl Inner {
                 return;
             }
             self.set_update_callback(state.ctx);
+        }
+
+        // Do not composite an empty FBO: before the first decoded frame it is
+        // black, which is what made hover previews flash black over the poster.
+        if !self.frame_ready.load(Ordering::Relaxed)
+            && unsafe { mpv_render_context_update(state.ctx) } & 1 == 0
+        {
+            return;
         }
 
         if !unsafe { prepare(gl, &mut state.gl, width, height) } {
@@ -628,17 +722,21 @@ impl Inner {
             let rc = mpv_render_context_render(state.ctx, params.as_mut_ptr());
             if rc < 0 {
                 eprintln!("embed: mpv render failed ({rc})");
+            } else {
+                self.frame_ready.store(true, Ordering::Relaxed);
             }
             mpv_render_context_report_swap(state.ctx);
 
             // mpv leaves its own viewport behind; put ours back or the frame
             // gets composited in the bottom-left corner of the window.
             gl.viewport(
-                viewport.left_px,
-                viewport.from_bottom_px,
-                viewport.width_px,
-                viewport.height_px,
+                full_left,
+                screen_height - full_top - height,
+                width,
+                height,
             );
+            gl.enable(glow::SCISSOR_TEST);
+            gl.scissor(clip_left, clip_from_bottom, clip_width, clip_height);
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             gl.use_program(Some(program));
             if let Some(location) = state.gl.size_uniform {
@@ -647,10 +745,25 @@ impl Inner {
             if let Some(location) = state.gl.radius_uniform {
                 gl.uniform_1_f32(Some(&location), 8.0 * info.pixels_per_point);
             }
+            if let Some(location) = state.gl.clip_pos_uniform {
+                gl.uniform_2_f32(
+                    Some(&location),
+                    clip_left as f32,
+                    clip_from_bottom as f32,
+                );
+            }
+            if let Some(location) = state.gl.clip_size_uniform {
+                gl.uniform_2_f32(
+                    Some(&location),
+                    clip_width as f32,
+                    clip_height as f32,
+                );
+            }
             gl.bind_vertex_array(Some(vao));
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            gl.disable(glow::SCISSOR_TEST);
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.bind_vertex_array(None);
         }
@@ -721,13 +834,23 @@ out vec4 color;
 uniform sampler2D frame;
 uniform vec2 size;
 uniform float radius;
+uniform vec2 clip_pos;
+uniform vec2 clip_size;
+float rounded(vec2 p, vec2 s, float r) {
+    vec2 half_size = s * 0.5;
+    vec2 q = abs(p - half_size) - (half_size - vec2(r));
+    return length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - r;
+}
 void main() {
     // Match the app's 8px rounded corners without a second geometry pass.
     vec2 p = uv * size;
-    vec2 half_size = size * 0.5;
-    vec2 q = abs(p - half_size) - (half_size - vec2(radius));
-    float d = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - radius;
-    if (d > 0.0) {
+    if (rounded(p, size, radius) > 0.0) {
+        discard;
+    }
+    // When scrolling clips the video, round the visible edge as well so the
+    // cut-off top does not become a square corner.
+    vec2 visible_p = gl_FragCoord.xy - clip_pos;
+    if (rounded(visible_p, clip_size, radius) > 0.0) {
         discard;
     }
     color = texture(frame, uv);
@@ -748,6 +871,8 @@ unsafe fn prepare(
         state.program = Some(program);
         state.size_uniform = gl.get_uniform_location(program, "size");
         state.radius_uniform = gl.get_uniform_location(program, "radius");
+        state.clip_pos_uniform = gl.get_uniform_location(program, "clip_pos");
+        state.clip_size_uniform = gl.get_uniform_location(program, "clip_size");
 
         let vao = gl.create_vertex_array();
         let vbo = gl.create_buffer();

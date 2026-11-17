@@ -7,7 +7,11 @@ browser engine anywhere**. Subscriptions, watch history and watch-time
 statistics live in local SQLite and sync between machines through cloud storage
 you already own.
 
-No Google account, no RustTube account, no telemetry, no webview.
+No Google account, no RustTube account, no telemetry, no webview, no server of
+its own. Privacy is structural: the only outbound requests are the metadata and
+stream lookups against public instances and YouTube, plus the updater's public
+GitHub release check — no identifiers, no analytics, and the update check can be
+turned off in Settings.
 
 ## Interface
 
@@ -22,10 +26,10 @@ area, and a player bar pinned to the bottom once something is playing.
 | Search | Channels and videos, with live channel suggestions (icon + name) as you type |
 | Subscriptions | Latest uploads from the channels you follow |
 | Channel | Banner, avatar, subscriber count, subscribe toggle, full upload list |
-| Watch | Poster with play/pause, title, likes, description, related rail |
+| Watch | Two-row player controls, title, likes, description, related rail |
 | History | Resume points, per-item progress, remove and clear |
 | Statistics | Total/weekly watch time, videos opened, streak, 30-day chart, top channels |
-| Settings | Instance, region, playback window, history, cloud sync, local data |
+| Settings | Playback defaults, instance, region, history, cloud sync, local data |
 
 ## Playback
 
@@ -41,11 +45,16 @@ Starting a video is kept fast deliberately:
   whole session, so loading a video is a single `loadfile` command — no process
   spawn, no socket handshake. External mode likewise keeps one mpv process warm;
   stopping returns it to idle instead of tearing it down.
-- **One HLS variant, cached.** `src/stream.rs` asks `yt-dlp` for the HLS master
-  playlist, then picks the best variant at or below 1080p and hands *that* to
-  mpv. Opening one variant instead of the master skips subtitle playlists and
-  ffmpeg's variant probing: measured **0.5 s to first frame at 1080p**, against
-  ~7 s when mpv resolves YouTube itself.
+- **One HLS variant, cached.** `src/stream.rs` first asks YouTube's visionOS
+  InnerTube player response for the HLS master playlist (typically ~0.1–0.2 s),
+  then picks the best variant at or below the selected quality and hands *that*
+  to mpv. If YouTube refuses that response, the existing `yt-dlp` path resolves
+  the same master instead. Auto uses 1080p; 2160p, 1440p, 1080p, 720p, 480p and
+  360p can be chosen from the player or Settings. Opening one variant instead
+  of the master skips subtitle playlists and ffmpeg's variant probing: measured
+  **~1.0 s click-to-first-frame**, against ~7 s when mpv resolves YouTube
+  itself. Streams are cached per video and quality, and changing quality while
+  playing reloads the same position and pause state.
 - **Prefetch on hover.** Resting the pointer on a card for 140 ms starts the
   resolution, so a click usually finds the URL already waiting.
 - **Immediate feedback.** The player bar appears the moment you click and shows
@@ -60,9 +69,30 @@ own yt-dlp hook.
 
 Playback state arrives through libmpv's event loop, which observes `time-pos`,
 `duration`, `pause` and `eof-reached`. That drives the UI *and* the statistics
-honestly — watch time only accrues while mpv reports playing. The player bar
-still controls pause, seeking and volume, and the video surface itself is
-clickable.
+honestly — watch time only accrues while mpv reports playing. The video surface
+itself is clickable, and the two-row overlay has a full-width seek bar with a
+hover timestamp, play/pause, 10-second skips, speed presets plus a slider,
+quality, volume/mute and the wide-player toggle. Speed, mute and quality persist
+in the settings table.
+
+Hover previews use a separate muted, looping libmpv instance. After 140 ms the
+stream is prefetched; after 700 ms the thumbnail plays from 10% of its duration
+(clamped to 5–30 seconds) with a small **Preview** badge. They work in the card
+grid, the related rail and History, stop when the pointer leaves the thumbnail,
+and stay on the poster for live items. Settings > Playback can disable them.
+
+### Keyboard shortcuts
+
+Shortcuts are ignored while a text field has the keyboard.
+
+| Key | Action |
+| --- | --- |
+| Space, K | Play/pause |
+| J, L | Seek 10 seconds |
+| Left, Right | Seek 5 seconds |
+| Up, Down | Volume ±5 |
+| M | Mute/unmute |
+| O, P | Speed down/up |
 
 ## Run it
 
@@ -84,6 +114,26 @@ cargo test           # unit + two-device sync tests
 cargo build --release
 ```
 
+### Cold-start benchmark
+
+The cold-start proof is a repo script rather than a set of shell incantations.
+It builds the debug binary, launches a **fresh process for every run** (so the
+stream cache and hover prefetch are cold), autoplays the fixed
+`dQw4w9WgXcQ` search result, reads the app's
+`click → first frame` timing, and prints the mean/median/min/max:
+
+```bash
+./scripts/cold-start.sh              # current direct-InnerTube path, 5 runs
+./scripts/cold-start.sh --legacy     # old yt-dlp client path, for the ~3.2 s before-style number
+./scripts/cold-start.sh --fallback   # current yt-dlp fallback, with InnerTube disabled
+./scripts/cold-start.sh --runs 10    # increase the sample size
+```
+
+It needs a desktop session, network access, and `yt-dlp` on `PATH` (or next to
+the binary). The app is killed as soon as the first-frame line appears; raw
+logs are kept in a temporary directory printed at the end. `--no-build` reuses
+`target/debug/rusttube` and skips the build step.
+
 macOS and Windows are both supported: the GL renderer has a Cocoa/OpenGL and a
 WGL implementation, and the app looks for a bundled `yt-dlp` before falling
 back to `PATH`.
@@ -103,6 +153,26 @@ Both are unsigned. macOS needs right-click → Open the first time (or
 where More info → Run anyway works. App data stays local
 (`%APPDATA%\RustTube` on Windows, `~/Library/Application Support/RustTube` on
 macOS).
+
+### Updates
+
+Released builds update themselves. Once a day RustTube asks GitHub for the
+newest release and, when it is newer, shows an **Update** button in the top bar
+and in Settings > Local data.
+
+- **macOS:** `Update & restart` replaces the whole `RustTube.app` bundle —
+  Frameworks, libmpv and the bundled `yt-dlp` included — checks the download
+  against the SHA-256 digest GitHub publishes for that asset, and relaunches
+  into the new build. It needs to be running from an `.app` bundle; a loose
+  `cargo run` binary only ever reports that a release exists.
+- **Windows:** a portable folder cannot be replaced while it is running, so the
+  button downloads the zip, unpacks it into `Downloads` and opens the folder.
+  Quit RustTube, swap the folder, done.
+
+Settings > Local data has **Check for updates automatically** (on by default)
+and a manual check. Publishing a release is just tagging: the workflow attaches
+both platform zips and the updater matches them by name. Set
+`RUSTTUBE_NO_UPDATE=1` to skip the check entirely.
 
 ## Data and sync
 
@@ -142,7 +212,7 @@ src/app.rs     the whole egui interface: routing, views, async message pump
 src/theme.rs   palette, painted icons, cards, progress bar, formatters
 src/embed.rs   libmpv instance, OpenGL FBO renderer, egui paint callback
 src/player.rs  separate mpv process, IPC commands and playback snapshots
-src/stream.rs  yt-dlp stream resolution, memory cache, deduplicated prefetch
+src/stream.rs  InnerTube/yt-dlp stream resolution, memory cache, deduplicated prefetch
 src/api.rs     Invidious + Piped client with per-request instance fallback
 src/db.rs      SQLite schema, watch writes, merge logic
 src/sync.rs    folder + WebDAV backends, sync orchestration
@@ -159,9 +229,8 @@ answered last is tried first next time. Any instance can be pinned in Settings.
   fail.
 - No account features (likes, comments, playlists), no downloads, no sponsor
   skipping.
-- Quality is capped at 1080p by default (`MAX_HEIGHT` in `src/stream.rs`). The
-  master playlist carries 1440p and 2160p too, so a quality preference is a
-  small change here.
+- Quality is capped at 1080p by default (`DEFAULT_MAX_HEIGHT` in
+  `src/stream.rs`). 1440p and 2160p are available when selected explicitly.
 - Sync is a single snapshot file. Two devices writing at the same instant can
   lose the loser's newest record until the next sync; per-record merges make
   that window small and non-destructive.
@@ -172,12 +241,14 @@ answered last is tried first next time. Any instance can be pinned in Settings.
 ## Verification
 
 `cargo test` covers payload parsing, HTML/entity cleanup, path expansion, URL
-building, merge semantics (tombstones, stale records, idempotent stats) and a
-two-device folder sync round trip.
+building, InnerTube → HLS stream parsing against captured fixtures, merge
+semantics (tombstones, stale records, idempotent stats) and a two-device folder
+sync round trip.
 
-Two opt-in tests need the outside world:
+Three opt-in tests need the outside world:
 
 ```bash
 cargo test mpv_plays_a_video_quickly -- --ignored --nocapture # real playback
+cargo test forced_innertube_failure_plays_through_the_ytdlp_fallback -- --ignored --nocapture
 cargo test live_instance_smoke_test -- --ignored --nocapture # real metadata
 ```

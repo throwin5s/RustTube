@@ -8,6 +8,7 @@ mod player;
 mod stream;
 mod sync;
 mod theme;
+mod update;
 
 use app::App;
 use eframe::egui;
@@ -19,6 +20,11 @@ fn main() -> eframe::Result<()> {
             .with_min_inner_size([900.0, 560.0])
             .with_title("RustTube")
             .with_app_id("rusttube")
+            // Draw the app into the titlebar area; the native traffic lights
+            // stay in place and the top bar becomes part of the window.
+            .with_fullsize_content_view(true)
+            .with_titlebar_shown(false)
+            .with_title_shown(false)
             .with_icon(window_icon()),
         ..Default::default()
     };

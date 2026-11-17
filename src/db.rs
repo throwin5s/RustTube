@@ -415,6 +415,11 @@ pub fn clear_history(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+pub fn reset_watch_stats(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM watch_stats", [])?;
+    Ok(())
+}
+
 // ----------------------------------------------------------------- statistics
 
 pub fn stats_overview(conn: &Connection) -> StatsOverview {
@@ -773,6 +778,29 @@ mod tests {
         assert_eq!(overview.total_videos, 2);
         assert_eq!(overview.devices, 2);
         assert_eq!(overview.today_seconds, 50);
+    }
+
+    #[test]
+    fn reset_watch_stats_clears_totals() {
+        let conn = memory_db();
+        record_watch(
+            &conn,
+            &WatchUpdate {
+                video_id: "v1",
+                title: "One",
+                channel_id: "UC1",
+                channel_name: "Chan",
+                duration: 100,
+                position: 30,
+                seconds: 30,
+                new_view: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(stats_overview(&conn).total_seconds, 30);
+        reset_watch_stats(&conn).unwrap();
+        assert_eq!(stats_overview(&conn).total_seconds, 0);
+        assert_eq!(stats_overview(&conn).total_videos, 0);
     }
 
     #[test]
