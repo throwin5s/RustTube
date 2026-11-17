@@ -154,6 +154,7 @@ enum UpdateState {
 
 #[derive(Clone, Default)]
 struct SyncStatus {
+    mode: String,
     enabled: bool,
     target: String,
     last_at: i64,
@@ -1248,6 +1249,7 @@ impl App {
         if let Some(status) = self.with_db(|conn| {
             let info = SyncSettings::load(conn).info(conn);
             SyncStatus {
+                mode: info.mode,
                 enabled: info.enabled,
                 target: info.target,
                 last_at: info.last_sync_at,
@@ -1357,7 +1359,16 @@ impl App {
             return;
         };
         if !settings.enabled() {
-            self.toast("Pick a cloud account, a folder or WebDAV first");
+            let message = match settings.mode.as_str() {
+                "cloud" => format!(
+                    "{} is not set up on this device — sign in to its desktop app, then sync again",
+                    sync::cloud_label(&settings.cloud)
+                ),
+                "folder" => "Set a sync folder first".to_string(),
+                "webdav" => "Set a WebDAV address first".to_string(),
+                _ => "Pick a cloud account, a folder or WebDAV first".to_string(),
+            };
+            self.toast(message);
             return;
         }
         self.sync_busy = true;
@@ -3897,8 +3908,10 @@ impl App {
                     ui.checkbox(&mut self.settings.sync_auto, "Sync automatically");
 
                     ui.add_space(6.0);
-                    let status = if !self.sync_status.enabled {
+                    let status = if self.sync_status.mode.is_empty() || self.sync_status.mode == "off" {
                         "Sync is off — everything stays on this device.".to_string()
+                    } else if !self.sync_status.enabled {
+                        format!("Not ready — {}", self.sync_status.target)
                     } else if !self.sync_status.last_error.is_empty() {
                         self.sync_status.last_error.clone()
                     } else if self.sync_status.last_at > 0 {
