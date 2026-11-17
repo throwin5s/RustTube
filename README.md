@@ -166,8 +166,9 @@ and in Settings > Local data.
   into the new build. It needs to be running from an `.app` bundle; a loose
   `cargo run` binary only ever reports that a release exists.
 - **Windows:** a portable folder cannot be replaced while it is running, so the
-  button downloads the zip, unpacks it into `Downloads` and opens the folder.
-  Quit RustTube, swap the folder, done.
+  button downloads the zip, unpacks it into `Downloads\RustTube-<version>` and
+  opens that folder; the runnable files sit in the `RustTube` folder inside it.
+  Quit RustTube, swap it in, done.
 
 Settings > Local data has **Check for updates automatically** (on by default)
 and a manual check. Publishing a release is just tagging: the workflow attaches
