@@ -182,10 +182,28 @@ both platform zips and the updater matches them by name. Set
 | macOS | `~/Library/Application Support/RustTube/rusttube.db` |
 | Windows | `%APPDATA%\RustTube\rusttube.db` |
 
+### Cloud sync
+
 Settings → Cross-device sync writes **one** `rusttube-sync.json` snapshot into a
-cloud-synced folder (iCloud Drive, OneDrive, Dropbox, a network share) or any
-WebDAV collection. Your provider's own client moves the file; RustTube only
-merges it. There is no server in between.
+cloud folder you already have, or any WebDAV collection. Your provider's own
+client moves the file; RustTube only merges it. There is no RustTube account and
+no server in between.
+
+Pick **Cloud account** and RustTube lists the clients it finds signed in on this
+machine: **Google Drive, OneDrive, iCloud Drive, Dropbox, pCloud and Box**. It
+never asks for a password — signing in to the provider's desktop app is the whole
+setup — and it stores the *provider*, not a path, so the same choice means
+`RustTube/rusttube-sync.json` inside that account on macOS and Windows alike.
+
+Because no path is stored, a second machine set to the same provider picks up the
+same file wherever that client mounts it (`~/Library/CloudStorage/…` on macOS, a
+drive letter on Windows). On a fresh install with exactly one cloud client
+signed in, RustTube adopts it automatically on first launch and syncs; otherwise
+it is one click in Settings. **Sync automatically** runs a merge on launch and
+every five minutes after that, always pull → merge → push.
+
+Folder mode still works for a network share or anything else that syncs, and
+WebDAV covers Nextcloud/ownCloud-style servers.
 
 ### Merge rules
 

@@ -126,6 +126,7 @@ struct SettingsDraft {
     api_current: String,
     history_enabled: bool,
     sync_mode: String,
+    sync_cloud: String,
     sync_folder: String,
     webdav_url: String,
     webdav_user: String,
@@ -639,6 +640,9 @@ pub struct App {
     settings: SettingsDraft,
     sync_status: SyncStatus,
     sync_busy: bool,
+    /// Last background sync attempt, so auto-sync does not hammer the cloud
+    /// client every frame.
+    last_auto_sync: Instant,
     update: UpdateState,
     wide_player: bool,
     preview_enabled: bool,
@@ -759,6 +763,7 @@ impl App {
             settings: SettingsDraft::default(),
             sync_status: SyncStatus::default(),
             sync_busy: false,
+            last_auto_sync: Instant::now(),
             update: UpdateState::Idle,
             wide_player: false,
             preview_enabled,
@@ -792,6 +797,8 @@ impl App {
         app.refresh_subs();
         app.load_settings_draft();
         app.refresh_sync_status();
+        app.adopt_cloud_if_unconfigured();
+        app.maybe_sync_on_launch();
         app.ensure_loaded();
         app.check_updates_on_launch();
         if let Ok(query) = std::env::var("RUSTTUBE_SHOT_QUERY") {
@@ -1143,6 +1150,7 @@ impl App {
                     .map(|v| v != "0")
                     .unwrap_or(true),
                 sync_mode: sync.mode,
+                sync_cloud: sync.cloud,
                 sync_folder: sync.folder,
                 webdav_url: sync.webdav_url,
                 webdav_user: sync.webdav_user,
@@ -1200,9 +1208,10 @@ impl App {
             );
             let mut sync = SyncSettings::load(conn);
             sync.mode = match draft.sync_mode.as_str() {
-                "folder" | "webdav" => draft.sync_mode.clone(),
+                "cloud" | "folder" | "webdav" => draft.sync_mode.clone(),
                 _ => "off".to_string(),
             };
+            sync.cloud = draft.sync_cloud.clone();
             sync.folder = draft.sync_folder.trim().to_string();
             sync.webdav_url = draft.webdav_url.trim().to_string();
             sync.webdav_user = draft.webdav_user.clone();
@@ -1276,6 +1285,70 @@ impl App {
         }
     }
 
+    /// First launch on a machine that has exactly one cloud client signed in:
+    /// adopt it, so the second device needs no setup at all. Devices where sync
+    /// was ever configured are left alone.
+    fn adopt_cloud_if_unconfigured(&mut self) {
+        let configured = self
+            .with_db(|conn| db::get_setting(conn, "sync_mode"))
+            .flatten()
+            .is_some_and(|mode| !mode.trim().is_empty());
+        if configured {
+            return;
+        }
+        let clouds = sync::detect_clouds();
+        let [cloud] = clouds.as_slice() else {
+            return;
+        };
+        let key = cloud.key.to_string();
+        let saved = self.with_db(|conn| {
+            let mut settings = SyncSettings::load(conn);
+            settings.mode = "cloud".into();
+            settings.cloud = key.clone();
+            settings.auto = true;
+            settings.save(conn).is_ok()
+        });
+        if saved != Some(true) {
+            return;
+        }
+        self.settings.sync_mode = "cloud".into();
+        self.settings.sync_cloud = key;
+        self.settings.sync_auto = true;
+        self.sync_now();
+    }
+
+    fn maybe_sync_on_launch(&mut self) {
+        let settings = self
+            .with_db(|conn| SyncSettings::load(conn))
+            .unwrap_or_default();
+        if settings.auto && settings.enabled() {
+            self.last_auto_sync = Instant::now();
+            self.sync_now();
+        }
+    }
+
+    /// Auto-sync runs in the background every few minutes, so a second device
+    /// catches up without anyone pressing anything.
+    fn auto_sync_tick(&mut self) {
+        if self.sync_busy || self.last_auto_sync.elapsed() < Duration::from_secs(300) {
+            return;
+        }
+        let settings = self
+            .with_db(|conn| SyncSettings::load(conn))
+            .unwrap_or_default();
+        if !settings.auto || !settings.enabled() {
+            return;
+        }
+        self.last_auto_sync = Instant::now();
+        self.sync_now();
+    }
+
+    /// A hover preview only replaces the poster once its own player has a
+    /// decoded frame; before that the badge would be advertising nothing.
+    fn preview_showing(&self, id: &str) -> bool {
+        self.preview_id.as_deref() == Some(id) && self.preview.has_rendered_frame()
+    }
+
     fn sync_now(&mut self) {
         if self.sync_busy {
             return;
@@ -1284,7 +1357,7 @@ impl App {
             return;
         };
         if !settings.enabled() {
-            self.toast("Set a sync folder or WebDAV address first");
+            self.toast("Pick a cloud account, a folder or WebDAV first");
             return;
         }
         self.sync_busy = true;
@@ -3080,10 +3153,13 @@ impl App {
                         ui.allocate_exact_size(Vec2::new(128.0, 72.0), Sense::hover());
                     self.paint_thumb(ui, thumb, &video.id, "mq");
                     thumb_hovered = thumb_response.hovered();
-                    let previewing = self.preview_id.as_deref() == Some(video.id.as_str());
-                    if previewing {
+                    if self.preview_id.as_deref() == Some(video.id.as_str()) {
+                        // Painting is what lets mpv deliver a frame; the badge
+                        // waits until one has actually arrived.
                         self.preview.paint(ui, thumb);
-                        self.preview_badge(ui, thumb);
+                        if self.preview_showing(&video.id) {
+                            self.preview_badge(ui, thumb);
+                        }
                     }
                     ui.add_space(8.0);
                     ui.vertical(|ui| {
@@ -3189,11 +3265,11 @@ impl App {
                                     ui.allocate_exact_size(Vec2::new(132.0, 74.0), Sense::hover());
                                 self.paint_thumb(ui, thumb, &item.video_id, "mq");
                                 thumb_hovered = thumb_response.hovered();
-                                let previewing =
-                                    self.preview_id.as_deref() == Some(item.video_id.as_str());
-                                if previewing {
+                                if self.preview_id.as_deref() == Some(item.video_id.as_str()) {
                                     self.preview.paint(ui, thumb);
-                                    self.preview_badge(ui, thumb);
+                                    if self.preview_showing(&item.video_id) {
+                                        self.preview_badge(ui, thumb);
+                                    }
                                 }
                                 if item.duration > 0 && item.position > 0 {
                                     let fraction =
@@ -3667,7 +3743,8 @@ impl App {
                     ui.horizontal(|ui| {
                         for (value, label) in [
                             ("off", "Off"),
-                            ("folder", "Cloud folder"),
+                            ("cloud", "Cloud account"),
+                            ("folder", "Folder"),
                             ("webdav", "WebDAV"),
                         ] {
                             ui.selectable_value(
@@ -3678,6 +3755,70 @@ impl App {
                         }
                     });
                     ui.add_space(10.0);
+
+                    if self.settings.sync_mode == "cloud" {
+                        let clouds = sync::detect_clouds();
+                        if clouds.is_empty() {
+                            ui.label(
+                                RichText::new(
+                                    "No cloud client found. Install and sign in to Google Drive, OneDrive, iCloud Drive, Dropbox, pCloud or Box, then reopen this page.",
+                                )
+                                .size(11.8)
+                                .color(t::DIM_2),
+                            );
+                        } else {
+                            ui.label(
+                                RichText::new(
+                                    "Sign in to the same account on every device; RustTube keeps its file inside a RustTube folder there.",
+                                )
+                                .size(11.8)
+                                .color(t::DIM_2),
+                            );
+                            ui.add_space(8.0);
+                            let mut chosen: Option<String> = None;
+                            ui.horizontal_wrapped(|ui| {
+                                for cloud in &clouds {
+                                    let active = self.settings.sync_cloud == cloud.key;
+                                    let button = ui.add(
+                                        egui::Button::new(
+                                            RichText::new(cloud.label).size(11.5).color(if active {
+                                                t::TEXT
+                                            } else {
+                                                t::DIM
+                                            }),
+                                        )
+                                        .fill(if active { t::PANEL_2 } else { Color32::TRANSPARENT })
+                                        .stroke(Stroke::new(
+                                            1.0_f32,
+                                            if active { t::ACCENT } else { t::LINE },
+                                        ))
+                                        .corner_radius(CornerRadius::same(t::RADIUS)),
+                                    );
+                                    if button
+                                        .on_hover_text(cloud.path.display().to_string())
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        .clicked()
+                                    {
+                                        chosen = Some(cloud.key.to_string());
+                                    }
+                                }
+                            });
+                            if let Some(key) = chosen {
+                                self.settings.sync_cloud = key;
+                                self.settings.sync_auto = true;
+                                self.save_settings();
+                                self.sync_now();
+                            }
+                            if let Some(path) = sync::cloud_folder(&self.settings.sync_cloud) {
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new(path.display().to_string())
+                                        .size(11.0)
+                                        .color(t::DIM_2),
+                                );
+                            }
+                        }
+                    }
 
                     if self.settings.sync_mode == "folder" {
                         ui.label(
@@ -4028,7 +4169,7 @@ impl App {
                 Self::preview_start(card.duration),
             ));
         }
-        if previewing {
+        if self.preview_showing(&card.id) {
             self.preview_badge(ui, thumb);
         }
 
@@ -4332,6 +4473,7 @@ impl eframe::App for App {
         }
         self.account_watch();
         self.log_first_frame();
+        self.auto_sync_tick();
         t::update_scrollbars(ctx);
         if let Some(err) = self.player.take_error() {
             self.toast(err);

@@ -1,9 +1,13 @@
 //! Cross-device synchronisation.
 //!
-//! RustTube stores one JSON snapshot in the storage you already have: a folder
-//! that iCloud Drive / OneDrive / Dropbox / Nextcloud / a network share keeps in
-//! sync, or any WebDAV server. There is no RustTube account and no server of
-//! ours in the middle.
+//! RustTube stores one JSON snapshot in the storage you already have: the folder
+//! a cloud client (iCloud Drive, Google Drive, OneDrive, Dropbox, pCloud, Box)
+//! keeps in sync, any other synced folder, or a WebDAV server. There is no
+//! RustTube account and no server of ours in the middle.
+//!
+//! Cloud mode stores the *provider*, not a path, so the same setup means the
+//! same place on macOS and Windows: whichever folder that client mounts, the
+//! snapshot lives in `RustTube/rusttube-sync.json` inside it.
 //!
 //! A sync is always: pull -> merge into SQLite -> write merged snapshot back.
 //! Merging is record level (see `db::merge_payload`), so adding a subscription
@@ -17,11 +21,15 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 pub const SNAPSHOT_NAME: &str = "rusttube-sync.json";
+/// Folder RustTube owns inside a cloud provider's mount.
+const CLOUD_SUBFOLDER: &str = "RustTube";
 
 #[derive(Clone, Debug, Default)]
 pub struct SyncSettings {
-    /// "off" | "folder" | "webdav"
+    /// "off" | "cloud" | "folder" | "webdav"
     pub mode: String,
+    /// Provider key for cloud mode, e.g. "gdrive". Portable across platforms.
+    pub cloud: String,
     pub folder: String,
     pub webdav_url: String,
     pub webdav_user: String,
@@ -44,6 +52,7 @@ pub struct SyncReport {
 #[derive(Serialize)]
 pub struct SyncInfo {
     pub mode: String,
+    pub cloud: String,
     pub folder: String,
     pub webdav_url: String,
     pub webdav_user: String,
@@ -68,6 +77,7 @@ impl SyncSettings {
         let mode = get("sync_mode");
         SyncSettings {
             mode: if mode.is_empty() { "off".into() } else { mode },
+            cloud: get("sync_cloud"),
             folder: get("sync_folder"),
             webdav_url: get("sync_webdav_url"),
             webdav_user: get("sync_webdav_user"),
@@ -78,6 +88,7 @@ impl SyncSettings {
 
     pub fn save(&self, conn: &Connection) -> rusqlite::Result<()> {
         db::set_setting(conn, "sync_mode", &self.mode)?;
+        db::set_setting(conn, "sync_cloud", &self.cloud)?;
         db::set_setting(conn, "sync_folder", &self.folder)?;
         db::set_setting(conn, "sync_webdav_url", &self.webdav_url)?;
         db::set_setting(conn, "sync_webdav_user", &self.webdav_user)?;
@@ -88,6 +99,7 @@ impl SyncSettings {
 
     pub fn enabled(&self) -> bool {
         match self.mode.as_str() {
+            "cloud" => cloud_folder(&self.cloud).is_some(),
             "folder" => !self.folder.trim().is_empty(),
             "webdav" => !self.webdav_url.trim().is_empty(),
             _ => false,
@@ -96,6 +108,9 @@ impl SyncSettings {
 
     pub fn target(&self) -> String {
         match self.mode.as_str() {
+            "cloud" => cloud_folder(&self.cloud)
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| format!("{} (desktop app not found)", cloud_label(&self.cloud))),
             "folder" => expand_path(&self.folder).map(|p| p.display().to_string()).unwrap_or_default(),
             "webdav" => self.webdav_url.trim().to_string(),
             _ => String::new(),
@@ -105,6 +120,7 @@ impl SyncSettings {
     pub fn info(&self, conn: &Connection) -> SyncInfo {
         SyncInfo {
             mode: self.mode.clone(),
+            cloud: self.cloud.clone(),
             folder: self.folder.clone(),
             webdav_url: self.webdav_url.clone(),
             webdav_user: self.webdav_user.clone(),
@@ -120,35 +136,145 @@ impl SyncSettings {
     }
 }
 
-pub fn presets() -> Vec<SyncPreset> {
-    let mut out = Vec::new();
-    let mut push = |label: &str, path: PathBuf| {
-        let exists = path.exists();
-        out.push(SyncPreset {
-            label: label.to_string(),
-            path: path.display().to_string(),
-            exists,
-        });
-    };
+/// A cloud service whose desktop client keeps a normal folder (or mounted
+/// drive) on this machine. Being signed in to one of these is the whole setup:
+/// the snapshot lives in `RustTube/` inside it.
+pub struct CloudMount {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub path: PathBuf,
+}
 
-    if cfg!(target_os = "macos") {
-        if let Some(home) = home_dir() {
-            push("iCloud Drive", home.join("Library/Mobile Documents/com~apple~CloudDocs"));
-            push("Dropbox", home.join("Dropbox"));
+pub fn detect_clouds() -> Vec<CloudMount> {
+    let Some(home) = home_dir() else {
+        return Vec::new();
+    };
+    let onedrive = std::env::var_os("OneDrive").map(PathBuf::from);
+    discover(&home, onedrive.as_deref())
+        .into_iter()
+        .map(|(key, label, path)| CloudMount { key, label, path })
+        .collect()
+}
+
+/// Where the snapshot goes for a provider key, or `None` when that client is not
+/// installed (the desktop app also does the signing in).
+pub fn cloud_folder(key: &str) -> Option<PathBuf> {
+    let home = home_dir()?;
+    let onedrive = std::env::var_os("OneDrive").map(PathBuf::from);
+    cloud_folder_in(&home, onedrive.as_deref(), key)
+}
+
+fn cloud_folder_in(
+    home: &std::path::Path,
+    onedrive: Option<&std::path::Path>,
+    key: &str,
+) -> Option<PathBuf> {
+    discover(home, onedrive)
+        .into_iter()
+        .find(|(found, _, _)| *found == key)
+        .map(|(_, _, path)| path.join(CLOUD_SUBFOLDER))
+}
+
+pub fn cloud_label(key: &str) -> &'static str {
+    match key {
+        "gdrive" => "Google Drive",
+        "onedrive" => "OneDrive",
+        "icloud" => "iCloud Drive",
+        "dropbox" => "Dropbox",
+        "pcloud" => "pCloud",
+        "box" => "Box",
+        _ => "a cloud folder",
+    }
+}
+
+pub fn presets() -> Vec<SyncPreset> {
+    detect_clouds()
+        .into_iter()
+        .map(|mount| SyncPreset {
+            label: mount.label.to_string(),
+            path: mount.path.display().to_string(),
+            exists: true,
+        })
+        .collect()
+}
+
+/// Every provider mount that exists right now, at most one per provider.
+fn discover(
+    home: &std::path::Path,
+    onedrive: Option<&std::path::Path>,
+) -> Vec<(&'static str, &'static str, PathBuf)> {
+    fn add(
+        found: &mut Vec<(&'static str, &'static str, PathBuf)>,
+        key: &'static str,
+        label: &'static str,
+        path: PathBuf,
+    ) {
+        if path.is_dir() && !found.iter().any(|(existing, _, _)| *existing == key) {
+            found.push((key, label, path));
         }
-    } else if cfg!(target_os = "windows") {
-        if let Some(onedrive) = std::env::var_os("OneDrive") {
-            push("OneDrive", PathBuf::from(onedrive));
-        }
-        if let Some(home) = home_dir() {
-            push("Dropbox", home.join("Dropbox"));
-        }
-    } else if let Some(home) = home_dir() {
-        push("Dropbox", home.join("Dropbox"));
     }
 
-    out.retain(|preset| preset.exists);
-    out
+    let mut found: Vec<(&'static str, &'static str, PathBuf)> = Vec::new();
+
+    // iCloud Drive (macOS), iCloud for Windows.
+    add(&mut found, "icloud", "iCloud Drive", home.join("Library/Mobile Documents/com~apple~CloudDocs"));
+    add(&mut found, "icloud", "iCloud Drive", home.join("iCloudDrive"));
+    // Dropbox and the older OneDrive/Google Drive locations.
+    add(&mut found, "dropbox", "Dropbox", home.join("Dropbox"));
+    if let Some(path) = onedrive {
+        add(&mut found, "onedrive", "OneDrive", path.to_path_buf());
+    }
+    add(&mut found, "onedrive", "OneDrive", home.join("OneDrive"));
+    add(&mut found, "gdrive", "Google Drive", home.join("Google Drive"));
+    add(&mut found, "pcloud", "pCloud", home.join("pCloud Drive"));
+    add(&mut found, "box", "Box", home.join("Box"));
+
+    // Google Drive, OneDrive and Box for desktop each mount an account under
+    // ~/Library/CloudStorage on macOS.
+    for mount in child_dirs(&home.join("Library/CloudStorage")) {
+        let Some(name) = mount.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with("GoogleDrive-") {
+            add(&mut found, "gdrive", "Google Drive", mount.join("My Drive"));
+        } else if name.starts_with("OneDrive-") {
+            add(&mut found, "onedrive", "OneDrive", mount);
+        } else if name.starts_with("Box-") {
+            add(&mut found, "box", "Box", mount);
+        }
+    }
+
+    // On Windows those clients mount a virtual drive instead: Google Drive as a
+    // letter holding "My Drive", pCloud as the P: drive.
+    if cfg!(target_os = "windows") {
+        for letter in b'C'..=b'Z' {
+            let drive = PathBuf::from(format!("{}:\\", letter as char));
+            add(&mut found, "gdrive", "Google Drive", drive.join("My Drive"));
+        }
+        add(&mut found, "pcloud", "pCloud", PathBuf::from("P:\\"));
+    }
+
+    // Stable order for the picker, independent of which path found the mount.
+    found.sort_by_key(|(key, _, _)| match *key {
+        "gdrive" => 0,
+        "onedrive" => 1,
+        "icloud" => 2,
+        "dropbox" => 3,
+        "pcloud" => 4,
+        _ => 5,
+    });
+    found
+}
+
+fn child_dirs(dir: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect()
 }
 
 pub async fn run(
@@ -210,8 +336,8 @@ pub fn record_failure(conn: &Mutex<Connection>, message: &str) {
 
 async fn pull(settings: &SyncSettings, http: &Client) -> Result<Option<String>, String> {
     match settings.mode.as_str() {
-        "folder" => {
-            let path = folder_file(settings)?;
+        "folder" | "cloud" => {
+            let path = snapshot_file(settings)?;
             match std::fs::read_to_string(&path) {
                 Ok(text) => Ok(Some(text)),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -238,8 +364,8 @@ async fn pull(settings: &SyncSettings, http: &Client) -> Result<Option<String>, 
 
 async fn push(settings: &SyncSettings, http: &Client, body: &str) -> Result<(), String> {
     match settings.mode.as_str() {
-        "folder" => {
-            let path = folder_file(settings)?;
+        "folder" | "cloud" => {
+            let path = snapshot_file(settings)?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("Could not create {}: {e}", parent.display()))?;
@@ -288,8 +414,18 @@ async fn push(settings: &SyncSettings, http: &Client, body: &str) -> Result<(), 
     }
 }
 
-fn folder_file(settings: &SyncSettings) -> Result<PathBuf, String> {
-    let dir = expand_path(&settings.folder)?;
+/// The file inside the synced folder. Cloud mode resolves the provider's mount
+/// on this machine, so the same setting works on macOS and Windows.
+fn snapshot_file(settings: &SyncSettings) -> Result<PathBuf, String> {
+    let dir = match settings.mode.as_str() {
+        "cloud" => cloud_folder(&settings.cloud).ok_or_else(|| {
+            format!(
+                "{} is not installed on this device. Sign in to its desktop app, or pick another provider.",
+                cloud_label(&settings.cloud)
+            )
+        })?,
+        _ => expand_path(&settings.folder)?,
+    };
     std::fs::create_dir_all(&dir).map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
     Ok(dir.join(SNAPSHOT_NAME))
 }
@@ -464,6 +600,64 @@ mod tests {
         assert_eq!(idle.records_applied, 0);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn finds_cloud_mounts_by_their_platform_paths() {
+        let home = std::env::temp_dir().join(format!("rusttube-home-{}", uuid::Uuid::new_v4()));
+        let mount = home.join("Library/CloudStorage/GoogleDrive-me@example.com/My Drive");
+        std::fs::create_dir_all(&mount).expect("gdrive mount");
+        std::fs::create_dir_all(home.join("pCloud Drive")).expect("pcloud mount");
+        std::fs::create_dir_all(home.join("Box")).expect("box mount");
+
+        let found = discover(&home, None);
+        let keys: Vec<&str> = found.iter().map(|(key, _, _)| *key).collect();
+        assert_eq!(keys, vec!["gdrive", "pcloud", "box"]);
+        assert_eq!(found[0].2, mount);
+
+        // A provider that is not installed is simply absent, not an error.
+        assert!(!keys.contains(&"onedrive"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn keeps_one_mount_per_provider() {
+        let home = std::env::temp_dir().join(format!("rusttube-home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(home.join("Dropbox")).expect("dropbox");
+        std::fs::create_dir_all(home.join("OneDrive")).expect("onedrive");
+        let other = home.join("elsewhere");
+        std::fs::create_dir_all(&other).expect("other onedrive");
+
+        let found = discover(&home, Some(&other));
+        let onedrives = found.iter().filter(|(key, _, _)| *key == "onedrive").count();
+        assert_eq!(onedrives, 1, "OneDrive should resolve to one folder");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cloud_folder_lands_inside_the_provider_mount() {
+        let home = std::env::temp_dir().join(format!("rusttube-home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(home.join("OneDrive")).expect("onedrive");
+        assert_eq!(
+            cloud_folder_in(&home, None, "onedrive"),
+            Some(home.join("OneDrive/RustTube"))
+        );
+        assert_eq!(cloud_folder_in(&home, None, "dropbox"), None, "not installed");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cloud_mode_resolves_the_provider_folder() {
+        let settings = SyncSettings {
+            mode: "cloud".into(),
+            cloud: "gdrive".into(),
+            ..Default::default()
+        };
+        // Either the provider is installed here, or the mode reports itself
+        // unavailable — never a path from another platform.
+        assert_eq!(settings.enabled(), cloud_folder("gdrive").is_some());
+        assert_eq!(cloud_label("gdrive"), "Google Drive");
+        assert_eq!(cloud_label("unknown"), "a cloud folder");
     }
 
     #[test]
