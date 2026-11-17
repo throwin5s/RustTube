@@ -178,6 +178,8 @@ fn install_into(release: &Release, bundle: Option<&Path>) -> Result<(), String> 
         .repo_name(REPO_NAME)
         .bin_name("RustTube")
         .current_version(&current)
+        // A GUI app has no terminal to answer self_update's "continue?" prompt.
+        .no_confirm(true)
         .bundle_path_in_archive("RustTube.app")
         // Release assets are named by hand in the workflow, so pick the exact
         // one instead of relying on self_update's target substring matching.
