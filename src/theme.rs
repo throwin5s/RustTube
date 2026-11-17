@@ -324,6 +324,8 @@ pub enum Icon {
     Sidebar,
     Volume,
     VolumeMuted,
+    Fullscreen,
+    ExitFullscreen,
 }
 
 pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32) -> Response {
@@ -381,6 +383,40 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: &Icon, color: Color
                 ],
                 Stroke::new(1.8_f32, color),
             ));
+        }
+        Icon::Fullscreen => {
+            // Four brackets opening outwards, the usual fullscreen glyph.
+            let stroke = Stroke::new(1.7_f32, color);
+            let reach = s * 0.42;
+            let arm = s * 0.24;
+            for (sx, sy) in [(-1.0_f32, -1.0_f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                let corner = egui::pos2(c.x + sx * reach, c.y + sy * reach);
+                painter.add(egui::Shape::line(
+                    vec![egui::pos2(corner.x, corner.y - sy * arm), corner],
+                    stroke,
+                ));
+                painter.add(egui::Shape::line(
+                    vec![egui::pos2(corner.x - sx * arm, corner.y), corner],
+                    stroke,
+                ));
+            }
+        }
+        Icon::ExitFullscreen => {
+            // Same brackets, turned inwards: the arrows point at the middle.
+            let stroke = Stroke::new(1.7_f32, color);
+            let reach = s * 0.32;
+            let arm = s * 0.24;
+            for (sx, sy) in [(-1.0_f32, -1.0_f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                let inner = egui::pos2(c.x + sx * reach, c.y + sy * reach);
+                painter.add(egui::Shape::line(
+                    vec![egui::pos2(inner.x + sx * arm, inner.y), inner],
+                    stroke,
+                ));
+                painter.add(egui::Shape::line(
+                    vec![inner, egui::pos2(inner.x, inner.y + sy * arm)],
+                    stroke,
+                ));
+            }
         }
         Icon::Sidebar => {
             for offset in [-0.32, 0.0, 0.32] {
@@ -607,11 +643,91 @@ pub fn format_relative(ms: i64) -> String {
     format!("{}y ago", months / 12)
 }
 
+// ------------------------------------------------------------------ motion
+
+/// Ease-out curve for the thumbnail-to-player animation: quick departure,
+/// long settle, which reads as deliberate rather than mechanical.
+pub fn ease_out_cubic(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// Slow, steady, slow. Unlike `ease_out_cubic` this starts at zero velocity,
+/// so a panel that is already large on screen does not jump a quarter of the
+/// way open on its very first frame.
+pub fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Interpolate both corners, so a rect can grow from a thumbnail to the player.
+pub fn lerp_rect(from: Rect, to: Rect, t: f32) -> Rect {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |a: f32, b: f32| a + (b - a) * t;
+    Rect::from_min_max(
+        egui::pos2(mix(from.min.x, to.min.x), mix(from.min.y, to.min.y)),
+        egui::pos2(mix(from.max.x, to.max.x), mix(from.max.y, to.max.y)),
+    )
+}
+
 pub fn initials(name: &str) -> String {
     name.split_whitespace()
         .take(2)
         .filter_map(|part| part.chars().next())
         .collect::<String>()
         .to_uppercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ease_out_cubic_is_clamped_and_monotonic() {
+        assert_eq!(ease_out_cubic(0.0), 0.0);
+        assert_eq!(ease_out_cubic(1.0), 1.0);
+        assert_eq!(ease_out_cubic(-2.0), 0.0);
+        assert_eq!(ease_out_cubic(3.0), 1.0);
+        let mut previous = 0.0;
+        for step in 0..=20 {
+            let value = ease_out_cubic(step as f32 / 20.0);
+            assert!(value >= previous, "curve must not go backwards");
+            previous = value;
+        }
+        // Fast departure, long settle: halfway through time is most of the way.
+        assert!(ease_out_cubic(0.5) > 0.8);
+    }
+
+    #[test]
+    fn smoothstep_is_symmetric_and_starts_at_rest() {
+        assert_eq!(smoothstep(0.0), 0.0);
+        assert_eq!(smoothstep(1.0), 1.0);
+        assert!((smoothstep(0.5) - 0.5).abs() < 1e-6);
+        // Almost nothing happens in the first frame, which is what stops the
+        // drawer from looking like it was simply switched on.
+        assert!(smoothstep(0.1) < 0.04);
+        assert!(smoothstep(0.9) > 0.96);
+        let mut previous = 0.0;
+        for step in 0..=20 {
+            let value = smoothstep(step as f32 / 20.0);
+            assert!(value >= previous, "curve must not go backwards");
+            previous = value;
+        }
+    }
+
+    #[test]
+    fn lerp_rect_starts_at_the_thumbnail_and_ends_at_the_player() {
+        let from = Rect::from_min_size(egui::pos2(10.0, 20.0), Vec2::new(200.0, 112.0));
+        let to = Rect::from_min_size(egui::pos2(40.0, 60.0), Vec2::new(800.0, 450.0));
+        assert_eq!(lerp_rect(from, to, 0.0), from);
+        assert_eq!(lerp_rect(from, to, 1.0), to);
+        assert_eq!(lerp_rect(from, to, -1.0), from);
+        assert_eq!(lerp_rect(from, to, 9.0), to);
+        let mid = lerp_rect(from, to, 0.5);
+        assert!(mid.width() > from.width() && mid.width() < to.width());
+        assert!(mid.min.x > from.min.x && mid.min.x < to.min.x);
+    }
+
+
 }
 

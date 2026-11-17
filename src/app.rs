@@ -104,7 +104,7 @@ enum Msg {
     Stream(String, u32, Result<Resolved, String>),
     Feed(Result<Vec<VideoCard>, String>),
     Channel(String, Result<ChannelSummary, String>),
-    ChannelMore(Vec<VideoCard>),
+    ChannelMore(String, Vec<VideoCard>),
     Detail(String, Result<Box<VideoDetail>, String>),
     SubAvatar(String, Option<String>),
     Sync(Result<SyncReport, String>),
@@ -134,7 +134,46 @@ struct SettingsDraft {
     has_password: bool,
     sync_auto: bool,
     auto_update: bool,
+    sidebar_hover: bool,
+    watch_zoom: bool,
+    anim_speed: String,
 }
+
+/// The card-to-player opening motion. The route only changes when this ends,
+/// so the finished watch page is never painted underneath the animation.
+#[derive(Clone)]
+struct OpenAnim {
+    card: VideoCard,
+    from: Rect,
+    target: Rect,
+    started: Instant,
+    /// The best still available at the click: maxres when it was prefetched,
+    /// otherwise the card's 320 px thumb.
+    texture: egui::TextureHandle,
+}
+
+/// Leaving a video: the player shrinks back toward the card that opened it
+/// while the watch page is covered, then the route swaps.
+#[derive(Clone)]
+struct CloseAnim {
+    id: String,
+    from: Rect,
+    to: Rect,
+    started: Instant,
+}
+
+/// Width of the left-edge strip that reveals the sidebar in hover mode. It is
+/// deliberately generous: macOS' rounded window edge eats the first pixels.
+const SIDEBAR_HOT_ZONE: f32 = 24.0;
+/// Sidebar slide duration at normal speed, in seconds.
+const SIDEBAR_DURATION: f32 = 0.26;
+/// How close to the end of a channel grid triggers the next page, in pixels.
+const CHANNEL_PREFETCH_DISTANCE: f32 = 900.0;
+/// Safety cap: a broken instance that always returns a full page should not
+/// keep the client fetching forever.
+const CHANNEL_PAGE_LIMIT: u32 = 25;
+/// Duration of the thumbnail-to-player expand.
+const REVEAL_DURATION: f32 = 0.32;
 
 /// What the updater is doing right now; drives the Settings card and the
 /// top-bar notice.
@@ -217,6 +256,13 @@ impl Thumbs {
             ctx.request_repaint();
         });
         None
+    }
+
+    /// Cached texture only; never starts a download. The reveal overlay must
+    /// not fire requests for thumbnails it merely wants to fly across.
+    fn peek(&self, key: &str) -> Option<egui::TextureHandle> {
+        let map = self.map.lock().ok()?;
+        map.get(key).cloned().flatten()
     }
 }
 
@@ -649,6 +695,42 @@ pub struct App {
     preview_enabled: bool,
     playback_menu_open: bool,
     sidebar_visible: bool,
+    /// Optional hover-to-reveal behaviour for the sidebar.
+    sidebar_hover: bool,
+    /// Current 0–1 reveal amount; always 0 or 1 when hover mode is off.
+    sidebar_reveal: f32,
+    /// Time-based slide state, so a stale `dt` after an idle frame cannot make
+    /// the drawer jump most of the way open on its first frame.
+    sidebar_from: f32,
+    sidebar_to: f32,
+    sidebar_started: Instant,
+    /// Animation speed preset: "slow", "normal" or "fast".
+    anim_speed: String,
+    /// Content rect of the page, used to keep the destination hidden while a
+    /// transition is in flight.
+    page_rect: Option<Rect>,
+    /// Optional thumbnail-to-player expand animation.
+    watch_zoom: bool,
+    /// Close the drawer after navigating from it, and keep it closed until the
+    /// pointer leaves, instead of it hovering over the new page.
+    drawer_hold: bool,
+    /// Card-to-player motion in flight; the route swaps when it ends.
+    opening: Option<OpenAnim>,
+    /// Player-to-card motion in flight before Back swaps the route.
+    closing: Option<CloseAnim>,
+    /// The player's rect on the watch page, for the close animation.
+    last_poster: Option<Rect>,
+    /// Where each video was opened from, with the route that showed the card.
+    open_origins: HashMap<String, (Route, Rect)>,
+    fullscreen: bool,
+    fullscreen_pending: Option<bool>,
+    /// When fullscreen was requested, to detect a refused native transition.
+    fullscreen_toggled_at: Instant,
+    fullscreen_fallback: bool,
+    fullscreen_restore: Option<Vec2>,
+    last_pointer_move: Instant,
+    channel_more_loading: bool,
+    channel_exhausted: bool,
     search_input: String,
     toast: Option<(String, Instant)>,
     clear_armed: bool,
@@ -706,6 +788,14 @@ impl App {
             &db::get_setting(&conn, "playback").unwrap_or_default(),
         );
         let sidebar_visible = db::get_setting(&conn, "sidebar_visible")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let sidebar_hover = db::get_setting(&conn, "sidebar_hover")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let anim_speed = anim_preset(&db::get_setting(&conn, "anim_speed").unwrap_or_default())
+            .to_string();
+        let watch_zoom = db::get_setting(&conn, "watch_zoom")
             .map(|v| v != "0")
             .unwrap_or(true);
         let mpv_path = crate::player::executable(
@@ -770,6 +860,27 @@ impl App {
             preview_enabled,
             playback_menu_open: false,
             sidebar_visible,
+            sidebar_hover,
+            sidebar_reveal: if sidebar_visible { 1.0 } else { 0.0 },
+            sidebar_from: if sidebar_visible { 1.0 } else { 0.0 },
+            sidebar_to: if sidebar_visible { 1.0 } else { 0.0 },
+            sidebar_started: Instant::now(),
+            anim_speed,
+            page_rect: None,
+            watch_zoom,
+            drawer_hold: false,
+            opening: None,
+            closing: None,
+            last_poster: None,
+            open_origins: HashMap::new(),
+            fullscreen: false,
+            fullscreen_pending: None,
+            fullscreen_toggled_at: Instant::now(),
+            fullscreen_fallback: false,
+            fullscreen_restore: None,
+            last_pointer_move: Instant::now(),
+            channel_more_loading: false,
+            channel_exhausted: false,
             search_input: String::new(),
             toast: None,
             clear_armed: false,
@@ -939,6 +1050,12 @@ impl App {
     /// stream or a video leaves it running under the next page.
     fn leave_watch(&mut self) {
         if matches!(self.route, Route::Watch(_)) {
+            if self.fullscreen {
+                self.fullscreen = false;
+                self.fullscreen_pending = Some(false);
+                self.ctx
+                    .send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            }
             self.flush_watch();
             if self.player.is_active() {
                 self.player.stop();
@@ -955,6 +1072,11 @@ impl App {
     }
 
     fn navigate(&mut self, route: Route) {
+        self.cancel_opening();
+        self.closing = None;
+        if self.sidebar_hover && !self.sidebar_visible && self.sidebar_reveal > 0.01 {
+            self.drawer_hold = true;
+        }
         self.hover_now = None;
         self.stop_preview();
         if self.route != route {
@@ -969,6 +1091,59 @@ impl App {
     fn back(&mut self) {
         self.hover_now = None;
         self.stop_preview();
+        // Back during the opening undoes the opening, not the page it started
+        // from; popping the stack here skipped a page.
+        if self.opening.is_some() {
+            self.cancel_opening();
+            return;
+        }
+        if self.closing.is_some() {
+            return;
+        }
+        if self.watch_zoom {
+            let current = match &self.route {
+                Route::Watch(id) => Some(id.clone()),
+                _ => None,
+            };
+            if let (Some(id), Some(from)) = (current, self.last_poster) {
+                if let Some((source, to)) = self.open_origins.get(&id).cloned() {
+                    // Only when we return to the page that showed the card; a
+                    // watch→watch back has no grid to land on.
+                    if !matches!(source, Route::Watch(_))
+                        && self.stack.last() == Some(&source)
+                    {
+                        let close = CloseAnim {
+                            id,
+                            from,
+                            to,
+                            started: Instant::now(),
+                        };
+                        // Swap now, not at the end: the destination page is what
+                        // slides back up underneath the poster, which is the
+                        // open played in reverse. `leave_watch` still runs while
+                        // the route is Watch, so playback stops and the audio
+                        // does not linger.
+                        self.perform_back();
+                        self.closing = Some(close);
+                        self.last_poster = None;
+                        self.ctx.request_repaint();
+                        return;
+                    }
+                }
+            }
+        }
+        self.finish_back();
+    }
+
+    /// The actual pop, once an optional close animation has finished.
+    fn finish_back(&mut self) {
+        self.closing = None;
+        self.perform_back();
+    }
+
+    /// Pop the watch page without touching the close animation, which so lets
+    /// the destination page draw while the poster is still on its way back.
+    fn perform_back(&mut self) {
         if let Some(previous) = self.stack.pop() {
             self.leave_watch();
             Self::remember(&mut self.forward_stack, self.route.clone());
@@ -979,12 +1154,28 @@ impl App {
 
     fn forward(&mut self) {
         self.hover_now = None;
+        self.closing = None;
+        self.cancel_opening();
         self.stop_preview();
         if let Some(next) = self.forward_stack.pop() {
             self.leave_watch();
             Self::remember(&mut self.stack, self.route.clone());
             self.route = next;
             self.ensure_loaded();
+        }
+    }
+
+    /// Start (or leave alone) the metadata fetch for a video. Opening a card
+    /// calls this before the route changes so the wait runs under the motion.
+    fn load_detail(&mut self, id: &str) {
+        if self.detail.is_idle() || self.detail_id != id {
+            self.detail_id = id.to_string();
+            self.detail = Load::Loading;
+            let api = self.api.clone();
+            let requested = id.to_string();
+            self.spawn(async move {
+                Msg::Detail(requested.clone(), api.video(&requested).await.map(Box::new))
+            });
         }
     }
 
@@ -1003,6 +1194,8 @@ impl App {
                 if self.channel.is_idle() || self.channel_id != id {
                     self.channel_id = id.clone();
                     self.channel_page = 1;
+                    self.channel_more_loading = false;
+                    self.channel_exhausted = false;
                     self.channel_videos.clear();
                     self.channel = Load::Loading;
                     let api = self.api.clone();
@@ -1012,15 +1205,7 @@ impl App {
                 }
             }
             Route::Watch(id) => {
-                if self.detail.is_idle() || self.detail_id != id {
-                    self.detail_id = id.clone();
-                    self.detail = Load::Loading;
-                    let api = self.api.clone();
-                    let requested = id.clone();
-                    self.spawn(async move {
-                        Msg::Detail(requested.clone(), api.video(&requested).await.map(Box::new))
-                    });
-                }
+                self.load_detail(&id);
                 if let Some(card) = self.find_card(&id) {
                     self.maybe_start(&card);
                 }
@@ -1109,6 +1294,25 @@ impl App {
                 return Some(card.clone());
             }
         }
+        // History rows have no video card of their own; a minimal one lets the
+        // watch page draw its poster immediately so the expand can animate.
+        if let Some(history) = self.history.ready() {
+            if let Some(item) = history.iter().find(|item| item.video_id == id) {
+                return Some(VideoCard {
+                    id: item.video_id.clone(),
+                    title: item.title.clone(),
+                    channel_id: item.channel_id.clone(),
+                    channel_name: item.channel_name.clone(),
+                    channel_avatar: String::new(),
+                    duration: item.duration,
+                    views: 0,
+                    published: String::new(),
+                    published_unix: 0,
+                    thumbnail: String::new(),
+                    live: false,
+                });
+            }
+        }
         if let Some(card) = self.channel_videos.iter().find(|card| card.id == id) {
             return Some(card.clone());
         }
@@ -1142,6 +1346,16 @@ impl App {
                 previews: db::get_setting(conn, "previews")
                     .map(|value| value != "0")
                     .unwrap_or(true),
+                sidebar_hover: db::get_setting(conn, "sidebar_hover")
+                    .map(|value| value == "1")
+                    .unwrap_or(false),
+                watch_zoom: db::get_setting(conn, "watch_zoom")
+                    .map(|value| value != "0")
+                    .unwrap_or(true),
+                anim_speed: anim_preset(
+                    &db::get_setting(conn, "anim_speed").unwrap_or_default(),
+                )
+                .to_string(),
                 auto_update: db::get_setting(conn, "auto_update")
                     .map(|value| value != "0")
                     .unwrap_or(true),
@@ -1165,6 +1379,12 @@ impl App {
         draft.api_current = self.api.current_endpoint();
         self.wide_player = draft.wide_player;
         self.preview_enabled = draft.previews;
+        self.sidebar_hover = draft.sidebar_hover;
+        self.watch_zoom = draft.watch_zoom;
+        self.anim_speed = draft.anim_speed.clone();
+        if !self.sidebar_hover {
+            self.sidebar_reveal = if self.sidebar_visible { 1.0 } else { 0.0 };
+        }
         self.settings = draft;
     }
 
@@ -1196,6 +1416,17 @@ impl App {
                 "previews",
                 if draft.previews { "1" } else { "0" },
             );
+            let _ = db::set_setting(
+                conn,
+                "sidebar_hover",
+                if draft.sidebar_hover { "1" } else { "0" },
+            );
+            let _ = db::set_setting(
+                conn,
+                "watch_zoom",
+                if draft.watch_zoom { "1" } else { "0" },
+            );
+            let _ = db::set_setting(conn, "anim_speed", anim_preset(&draft.anim_speed));
             let _ = db::set_setting(
                 conn,
                 "auto_update",
@@ -1497,6 +1728,13 @@ impl App {
                     }
                     self.prefetched.insert((id.to_string(), height));
                     self.resolve(id, height);
+                    // The card grid only shows the 320 px thumb; having the
+                    // full still ready is what makes the expand sharp.
+                    self.thumbs.get(
+                        &self.ctx,
+                        &format!("{id}-maxres"),
+                        format!("https://i.ytimg.com/vi/{id}/maxresdefault.jpg"),
+                    );
                 }
             }
         }
@@ -1797,15 +2035,31 @@ impl App {
                 }
             }
             Msg::Feed(result) => self.feed = loaded(result),
-            Msg::ChannelMore(mut more) => {
-                // Clicking "Load more" twice used to append the same page twice.
-                for card in more.drain(..) {
-                    if !self
-                        .channel_videos
-                        .iter()
-                        .any(|existing| existing.id == card.id)
-                    {
-                        self.channel_videos.push(card);
+            Msg::ChannelMore(id, mut more) => {
+                self.channel_more_loading = false;
+                if more.is_empty() {
+                    self.channel_exhausted = true;
+                }
+                // A page that arrives after the user left must not leak into
+                // another channel's list, and pages can repeat an item.
+                let still_open = matches!(&self.route, Route::Channel(open) if open == &id);
+                if id == self.channel_id && still_open {
+                    let arrived = more.len();
+                    let mut appended = 0;
+                    for card in more.drain(..) {
+                        if !self
+                            .channel_videos
+                            .iter()
+                            .any(|existing| existing.id == card.id)
+                        {
+                            self.channel_videos.push(card);
+                            appended += 1;
+                        }
+                    }
+                    // An instance that ignores the page parameter repeats the
+                    // first page forever; stop instead of fetching 25 copies.
+                    if arrived > 0 && appended == 0 {
+                        self.channel_exhausted = true;
                     }
                 }
             }
@@ -2051,7 +2305,9 @@ impl App {
                 let near_toggle = ctx
                     .pointer_hover_pos()
                     .is_some_and(|pos| hover_zone.contains(pos));
-                if near_toggle {
+                // Also show it while the drawer is out, so pinning is
+                // discoverable instead of hidden in a corner hotspot.
+                if near_toggle || (self.sidebar_hover && self.sidebar_reveal > 0.2) {
                     let toggle = ui
                         .interact(
                             toggle_rect,
@@ -2083,7 +2339,13 @@ impl App {
                             )
                         });
                     }
-                    toggle.on_hover_text(if self.sidebar_visible {
+                    toggle.on_hover_text(if self.sidebar_hover {
+                        if self.sidebar_visible {
+                            "Unpin sidebar"
+                        } else {
+                            "Pin sidebar open"
+                        }
+                    } else if self.sidebar_visible {
                         "Hide sidebar"
                     } else {
                         "Show sidebar"
@@ -2138,6 +2400,432 @@ impl App {
             });
     }
 
+    /// Eased sidebar reveal. With hover mode off it snaps, so the classic
+    /// fixed sidebar keeps its old behaviour exactly.
+    fn animate_sidebar(&mut self, ctx: &egui::Context) {
+        let pointer = ctx.pointer_hover_pos();
+        let mut target = sidebar_target(
+            self.sidebar_visible,
+            self.sidebar_hover,
+            self.sidebar_reveal,
+            pointer,
+            ctx.input(|input| input.screen_rect()),
+        );
+        if self.drawer_hold {
+            let away = pointer.is_none_or(|pos| {
+                pos.x > ctx.screen_rect().left() + t::SIDEBAR_WIDTH
+                    || pos.y < t::TOP_BAR_HEIGHT
+            });
+            // Release the hold once the drawer has actually closed, otherwise
+            // a pointer that stayed in the left column after a nav click would
+            // keep it suppressed forever.
+            if away || self.sidebar_reveal <= 0.01 {
+                self.drawer_hold = false;
+            } else {
+                target = 0.0;
+            }
+        }
+        if !self.sidebar_hover {
+            self.sidebar_reveal = target;
+            self.sidebar_from = target;
+            self.sidebar_to = target;
+            self.sidebar_started = Instant::now();
+            return;
+        }
+        if target != self.sidebar_to {
+            self.sidebar_from = self.sidebar_reveal;
+            self.sidebar_to = target;
+            self.sidebar_started = Instant::now();
+        }
+        // Time-based rather than dt-based: the first frame after an idle
+        // stretch used to carry a huge dt and snap the drawer most of the way
+        // open, which read as a pop instead of a slide.
+        let duration = SIDEBAR_DURATION * self.anim_scale();
+        let t = (self.sidebar_started.elapsed().as_secs_f32() / duration).clamp(0.0, 1.0);
+        self.sidebar_reveal =
+            self.sidebar_from + (self.sidebar_to - self.sidebar_from) * t::smoothstep(t);
+        if t < 1.0 {
+            ctx.request_repaint();
+        }
+    }
+
+    fn anim_scale(&self) -> f32 {
+        anim_scale(&self.anim_speed)
+    }
+
+    /// Going back is a release, not an arrival: it should feel a touch quicker
+    /// than the open, or the blank page underneath reads as a stall.
+    fn close_duration(&self) -> f32 {
+        REVEAL_DURATION * self.anim_scale() * 0.75
+    }
+
+    fn set_anim_speed(&mut self, preset: &str) {
+        let preset = anim_preset(preset);
+        self.settings.anim_speed = preset.to_string();
+        self.anim_speed = preset.to_string();
+        let _ = self.with_db(|conn| db::set_setting(conn, "anim_speed", preset));
+    }
+
+    /// An external MPV window has nothing to fill the screen with, so only the
+    /// embedded player can go immersive.
+    fn can_go_fullscreen(&self) -> bool {
+        matches!(self.route, Route::Watch(_))
+            && self.player.is_active()
+            && !self.player.is_external()
+    }
+
+    fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
+        self.fullscreen = !self.fullscreen;
+        self.fullscreen_pending = Some(self.fullscreen);
+        self.fullscreen_toggled_at = Instant::now();
+        self.last_pointer_move = Instant::now();
+        if self.fullscreen {
+            self.fullscreen_restore =
+                ctx.input(|input| input.viewport().inner_rect.map(|rect| rect.size()));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            if self.fullscreen_fallback {
+                self.fullscreen_fallback = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+                if let Some(size) = self.fullscreen_restore.take() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                }
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    /// The OS can leave fullscreen on its own (Esc, the green button, Mission
+    /// Control). Follow it, without fighting a command that is still in flight.
+    fn sync_fullscreen(&mut self, ctx: &egui::Context) {
+        let actual = ctx.input(|input| input.viewport().fullscreen);
+        if let Some(actual) = actual {
+            if self.fullscreen_pending == Some(actual) {
+                self.fullscreen_pending = None;
+            } else if self.fullscreen_pending.is_none() && actual != self.fullscreen {
+                self.fullscreen = actual;
+            }
+        }
+        // Some window managers ignore or refuse the native transition. In that
+        // case fall back to a borderless window the size of the display, so
+        // the mode is still genuinely edge-to-edge.
+        if !self.fullscreen && self.fullscreen_fallback {
+            self.fullscreen_fallback = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+            if let Some(size) = self.fullscreen_restore.take() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            }
+        }
+        if self.fullscreen
+            && actual != Some(true)
+            && !self.fullscreen_fallback
+            && self.fullscreen_toggled_at.elapsed() > Duration::from_secs(2)
+        {
+            if let Some(size) = ctx.input(|input| input.viewport().monitor_size) {
+                self.fullscreen_fallback = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                    0.0, 0.0,
+                )));
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    /// Letterboxed, chrome-free player for the immersive layout.
+    fn fullscreen_view(&mut self, ui: &mut Ui) {
+        let Route::Watch(id) = self.route.clone() else {
+            return;
+        };
+        // The player is enough to fill the screen; metadata must never leave a
+        // blank fullscreen page just because the card has not been cached.
+        let card = self.find_card(&id).or_else(|| {
+            self.player.now().map(|now| VideoCard {
+                id: now.video_id.clone(),
+                title: now.title.clone(),
+                channel_id: now.channel_id.clone(),
+                channel_name: now.channel_name.clone(),
+                channel_avatar: String::new(),
+                duration: now.duration_hint,
+                views: 0,
+                published: String::new(),
+                published_unix: 0,
+                thumbnail: String::new(),
+                live: false,
+            })
+        });
+        let Some(card) = card else {
+            return;
+        };
+        let screen = ui.ctx().screen_rect();
+        let aspect = 16.0 / 9.0;
+        let mut width = screen.width();
+        let mut height = width / aspect;
+        if height > screen.height() {
+            height = screen.height();
+            width = height * aspect;
+        }
+        let poster = Rect::from_center_size(screen.center(), Vec2::new(width, height));
+        ui.painter().rect_filled(screen, 0.0, Color32::BLACK);
+        ui.painter().rect_filled(poster, 0.0, Color32::BLACK);
+        let snapshot = self.player.snapshot();
+        if snapshot.started {
+            self.player.paint(ui, poster);
+        }
+        // Claim the surface before the HUD: widgets added later sit on top, so
+        // the controls keep their clicks.
+        let response = ui.interact(poster, egui::Id::new("fullscreen-player"), Sense::click());
+        self.video_hud(ui, &card, poster, snapshot);
+        if response.clicked() {
+            self.player.toggle_pause();
+        }
+        // The hint fades away while the mouse rests, and comes back as soon as
+        // it moves, like a normal video player.
+        let idle = self.last_pointer_move.elapsed().as_secs_f32();
+        let hint = (1.0 - (idle - 2.0).max(0.0) / 0.8).clamp(0.0, 1.0);
+        if hint > 0.0 {
+            ui.painter().text(
+                egui::pos2(screen.center().x, screen.top() + 16.0),
+                Align2::CENTER_TOP,
+                "F to exit fullscreen",
+                t::medium(11.0),
+                t::DIM_2.gamma_multiply(hint),
+            );
+        }
+    }
+
+    fn opening_progress(&self) -> f32 {
+        self.opening
+            .as_ref()
+            .map(|open| {
+                (open.started.elapsed().as_secs_f32()
+                    / (REVEAL_DURATION * self.anim_scale()))
+                    .clamp(0.0, 1.0)
+            })
+            .unwrap_or(0.0)
+    }
+
+    fn closing_progress(&self) -> f32 {
+        self.closing
+            .as_ref()
+            .map(|close| {
+                (close.started.elapsed().as_secs_f32() / self.close_duration()).clamp(0.0, 1.0)
+            })
+            .unwrap_or(0.0)
+    }
+
+    /// Where the player will land, using the same width math as `view_watch`.
+    /// The opening ends exactly there, which is what makes the swap invisible.
+    fn watch_target_rect(&self) -> Option<Rect> {
+        let page = self.page_rect?;
+        let available = (page.width() - 20.0).max(0.0);
+        let wide = self.wide_player && !self.player.is_external();
+        let width = player_width(available, wide);
+        Some(Rect::from_min_size(
+            page.min,
+            Vec2::new(width, (width * 0.5625).round()),
+        ))
+    }
+
+    /// Start the card-to-player motion. Playback and the detail fetch begin in
+    /// this same frame, so the animation covers the load instead of adding to
+    /// it, and the watch page is not drawn until the card has arrived.
+    fn begin_open(&mut self, id: String, from: Rect) {
+        if self.opening.is_some() || self.closing.is_some() {
+            return;
+        }
+        // A stale rect from the previous video would send Back somewhere odd
+        // if this page is left before its own poster has been drawn.
+        self.last_poster = None;
+        if !self.watch_zoom {
+            self.navigate(Route::Watch(id));
+            return;
+        }
+        let Some(card) = self.find_card(&id) else {
+            self.navigate(Route::Watch(id));
+            return;
+        };
+        // Ask for the 1280 px still now (hover usually fetched it already) and
+        // use it for the whole flight when it is ready. The card's thumb is the
+        // fallback, so the animation never starts from a blank image.
+        let hq = self.thumbs.get(
+            &self.ctx,
+            &format!("{id}-maxres"),
+            format!("https://i.ytimg.com/vi/{id}/maxresdefault.jpg"),
+        );
+        let mq = self.thumbs.get(
+            &self.ctx,
+            &format!("{id}-mq"),
+            format!("https://i.ytimg.com/vi/{id}/mqdefault.jpg"),
+        );
+        let Some(texture) = hq.or(mq) else {
+            self.navigate(Route::Watch(id));
+            return;
+        };
+        let Some(target) = self.watch_target_rect() else {
+            self.navigate(Route::Watch(id));
+            return;
+        };
+        self.hover_now = None;
+        self.stop_preview();
+        self.start_playback(&card);
+        self.load_detail(&id);
+        self.open_origins
+            .insert(id.clone(), (self.route.clone(), from));
+        self.opening = Some(OpenAnim {
+            card,
+            from,
+            target,
+            started: Instant::now(),
+            texture,
+        });
+        self.ctx.request_repaint();
+    }
+
+    /// Swap to the watch page once the card has reached the player rect. Until
+    /// this runs, the watch page has never been drawn.
+    fn advance_opening(&mut self) {
+        let Some(open) = self.opening.as_ref() else {
+            return;
+        };
+        if !transition_finished(
+            open.started.elapsed().as_secs_f32(),
+            REVEAL_DURATION * self.anim_scale(),
+        ) {
+            self.ctx.request_repaint();
+            return;
+        }
+        let id = open.card.id.clone();
+        self.opening = None;
+        Self::remember(&mut self.stack, self.route.clone());
+        self.forward_stack.clear();
+        self.route = Route::Watch(id);
+        self.ensure_loaded();
+    }
+
+    /// Abandon an opening (Escape or another navigation) and stop the stream it
+    /// already started, so a cancelled open never plays under the grid.
+    fn cancel_opening(&mut self) {
+        if self.opening.take().is_some() {
+            if self.player.is_active() {
+                self.player.stop();
+                self.attempted = None;
+                self.last_pos = 0.0;
+                self.watch_acc = 0.0;
+            }
+        }
+    }
+
+    /// The card, now a floating image, on its way to the player rect.
+    fn draw_opening(&mut self, ctx: &egui::Context) {
+        let Some(open) = self.opening.clone() else {
+            return;
+        };
+        let eased = t::ease_out_cubic(self.opening_progress());
+        let rect = t::lerp_rect(open.from, open.target, eased);
+        // Upgrade to the 1280 px still as soon as it arrives, so the flight ends
+        // on the same texture the watch page is about to show.
+        let texture = self
+            .thumbs
+            .peek(&format!("{}-maxres", open.card.id))
+            .unwrap_or(open.texture);
+        let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("opening-card"));
+        ctx.layer_painter(layer).rect_filled(
+            rect.translate(Vec2::new(0.0, 8.0)),
+            CornerRadius::same(t::RADIUS),
+            Color32::from_black_alpha(110),
+        );
+        paint_rounded_image(
+            ctx,
+            layer,
+            egui::Id::new("opening-image"),
+            rect,
+            &texture,
+            t::RADIUS,
+        );
+        ctx.request_repaint();
+    }
+
+    /// Leaving a video: cover the watch page and shrink the player back toward
+    /// the card. The grid is only revealed once the motion is over.
+    fn draw_closing(&mut self, ctx: &egui::Context) {
+        let Some(close) = self.closing.clone() else {
+            return;
+        };
+        let t = self.closing_progress();
+        let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("closing-card"));
+        let painter = ctx.layer_painter(layer);
+        // No cover: the destination page is already drawing underneath, pushed
+        // down and dimmed, and rises into place as the poster lands on its card.
+        if let Some(texture) = self
+            .thumbs
+            .peek(&format!("{}-maxres", close.id))
+            .or_else(|| self.thumbs.peek(&format!("{}-mq", close.id)))
+        {
+            let rect = t::lerp_rect(close.from, close.to, t::smoothstep(t));
+            painter.rect_filled(
+                rect.translate(Vec2::new(0.0, 6.0)),
+                CornerRadius::same(t::RADIUS),
+                Color32::from_black_alpha(90),
+            );
+            paint_rounded_image(
+                ctx,
+                layer,
+                egui::Id::new("closing-image"),
+                rect,
+                &texture,
+                t::RADIUS,
+            );
+        }
+        ctx.request_repaint();
+    }
+
+    fn advance_closing(&mut self) {
+        let Some(close) = self.closing.as_ref() else {
+            return;
+        };
+        if !transition_finished(close.started.elapsed().as_secs_f32(), self.close_duration()) {
+            self.ctx.request_repaint();
+            return;
+        }
+        // The route swap already happened when the motion started; this only
+        // drops the overlay, exposing the page at its final position.
+        self.closing = None;
+        self.ctx.request_repaint();
+    }
+
+    /// A slim handle on the left edge while hover mode is armed and closed.
+    /// It shows where to hover, and that the drawer exists at all.
+    fn sidebar_grip(&self, ctx: &egui::Context) {
+        if !self.sidebar_hover || self.sidebar_visible || self.sidebar_reveal > 0.02 {
+            return;
+        }
+        let screen = ctx.screen_rect();
+        let top = t::TOP_BAR_HEIGHT;
+        let height = 96.0;
+        let rect = Rect::from_min_size(
+            egui::pos2(
+                screen.left() + 3.0,
+                top + (screen.height() - top - height).max(0.0) * 0.5,
+            ),
+            Vec2::new(3.0, height),
+        );
+        let hovered = ctx
+            .pointer_hover_pos()
+            .is_some_and(|pos| rect.expand2(Vec2::new(10.0, 14.0)).contains(pos));
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("sidebar-grip"),
+        ))
+        .rect_filled(
+            rect,
+            CornerRadius::same(2),
+            t::ACCENT.gamma_multiply(if hovered { 0.95 } else { 0.35 }),
+        );
+    }
+
     fn side_bar(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("side")
             .exact_width(t::SIDEBAR_WIDTH)
@@ -2148,6 +2836,55 @@ impl App {
                     .inner_margin(Margin::symmetric(12, 12)),
             )
             .show(ctx, |ui| {
+                ui.set_width(t::SIDEBAR_WIDTH - 24.0);
+                self.side_content(ui);
+            });
+    }
+
+    /// Hover mode's sidebar: the same content on a floating panel that slides
+    /// over the page. It deliberately does not resize the central panel —
+    /// animating that width made every card behind it re-layout each frame.
+    fn hover_drawer(&mut self, ctx: &egui::Context) {
+        let reveal = self.sidebar_reveal.clamp(0.0, 1.0);
+        if reveal <= 0.001 {
+            return;
+        }
+        // `reveal` is already an ease-out curve; adding a second one made the
+        // drawer jump most of the way open on its first frame and then crawl.
+        let screen = ctx.screen_rect();
+        let top = t::TOP_BAR_HEIGHT;
+        let x = screen.left() - t::SIDEBAR_WIDTH * (1.0 - reveal);
+        egui::Area::new(egui::Id::new("sidebar-drawer"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(x, top))
+            .interactable(true)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(t::PANEL)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [3, 0],
+                        blur: 24,
+                        spread: 0,
+                        color: Color32::from_black_alpha(150),
+                    })
+                    .corner_radius(CornerRadius {
+                        nw: 0,
+                        ne: t::RADIUS,
+                        sw: 0,
+                        se: t::RADIUS,
+                    })
+                    .inner_margin(Margin::symmetric(12, 12))
+                    .show(ui, |ui| {
+                        ui.set_width(t::SIDEBAR_WIDTH - 24.0);
+                        ui.set_height((screen.height() - top - 24.0).max(120.0));
+                        self.side_content(ui);
+                    });
+            });
+    }
+
+    /// Navigation plus the subscription list, shared by the docked sidebar and
+    /// the hover drawer.
+    fn side_content(&mut self, ui: &mut Ui) {
                 ui.add_space(8.0);
 
                 let active = self.route.nav_key();
@@ -2218,7 +2955,6 @@ impl App {
                             ui.add_space(4.0);
                         }
                     });
-            });
     }
 
     fn paint_thumb(&self, ui: &mut Ui, rect: Rect, video_id: &str, quality: &str) {
@@ -2231,6 +2967,22 @@ impl App {
                     .paint_at(ui, rect);
             }
             None => t::placeholder_thumbnail(ui.painter(), rect),
+        }
+    }
+
+    /// Poster for the watch page: the full-resolution still when it has
+    /// arrived, otherwise the already-cached card thumbnail, so the frame the
+    /// opening animation lands on is never a grey placeholder.
+    fn paint_poster(&self, ui: &mut Ui, rect: Rect, video_id: &str) {
+        let url = format!("https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg");
+        let key = format!("{video_id}-maxres");
+        match self.thumbs.get(&self.ctx, &key, url) {
+            Some(texture) => {
+                egui::Image::from_texture(egui::load::SizedTexture::from_handle(&texture))
+                    .corner_radius(CornerRadius::same(t::RADIUS))
+                    .paint_at(ui, rect);
+            }
+            None => self.paint_thumb(ui, rect, video_id, "mq"),
         }
     }
 
@@ -2556,19 +3308,38 @@ impl App {
         let has_videos = !videos.is_empty();
         self.video_grid(ui, videos);
 
-        if has_videos && t::quiet_button(ui, "Load more").clicked() {
-            let next = self.channel_page + 1;
-            self.channel_page = next;
-            let api = self.api.clone();
-            let channel_id = id.clone();
-            let tx = self.tx.clone();
-            let ctx = self.ctx.clone();
-            self.rt.spawn(async move {
-                if let Ok(more) = api.channel_videos(&channel_id, next).await {
-                    let _ = tx.send(Msg::ChannelMore(more));
+        if has_videos {
+            if self.channel_more_loading {
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Loading more…").size(11.5).color(t::DIM_2));
+                });
+            } else if wants_more_page(
+                ui.clip_rect().bottom(),
+                ui.min_rect().bottom(),
+                self.channel_more_loading,
+                self.channel_exhausted,
+                self.channel_page,
+            ) {
+                let next = self.channel_page + 1;
+                self.channel_page = next;
+                self.channel_more_loading = true;
+                let api = self.api.clone();
+                let channel_id = id.clone();
+                let tx = self.tx.clone();
+                let ctx = self.ctx.clone();
+                self.rt.spawn(async move {
+                    // An empty page ends the feed; a failed request behaves the
+                    // same way rather than hammering the instance every frame.
+                    let more = api
+                        .channel_videos(&channel_id, next)
+                        .await
+                        .unwrap_or_default();
+                    let _ = tx.send(Msg::ChannelMore(channel_id.clone(), more));
                     ctx.request_repaint();
-                }
-            });
+                });
+            }
         }
     }
 
@@ -2582,6 +3353,11 @@ impl App {
         poster: Rect,
         snapshot: crate::embed::Snapshot,
     ) -> Option<Rect> {
+        // No transport controls over a picture that is not on screen yet; the
+        // poster and its "Starting…" badge own that state.
+        if !snapshot.started {
+            return None;
+        }
         let pointer_over = ui
             .ctx()
             .pointer_hover_pos()
@@ -2712,6 +3488,18 @@ impl App {
             let show_quality = hud_width > 390.0;
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
+                let full = self.fullscreen;
+                let (full_icon, full_hint) = if full {
+                    (t::Icon::ExitFullscreen, "Exit fullscreen (Esc)")
+                } else {
+                    (t::Icon::Fullscreen, "Fullscreen (F)")
+                };
+                if t::icon_button(ui, full_icon, 28.0)
+                    .on_hover_text(full_hint)
+                    .clicked()
+                {
+                    self.toggle_fullscreen(ui.ctx());
+                }
                 if show_wide {
                     let wide = ui
                         .selectable_label(
@@ -2827,6 +3615,9 @@ impl App {
             .or_else(|| self.find_card(&id));
 
         let Some(card) = card else {
+            // No poster on screen yet, so there is no rect for an expand (or a
+            // return) to start from.
+            self.last_poster = None;
             let failure = match &self.detail {
                 Load::Failed(err) => Some(err.clone()),
                 _ => None,
@@ -2849,11 +3640,7 @@ impl App {
         let available = ui.available_width();
         let wide = self.wide_player && !self.player.is_external();
         // Keep the related rail usable without ever producing clamp(min > max).
-        let left_width = if wide {
-            available
-        } else {
-            (available * 0.64).max(320.0).min((available - 300.0).max(320.0))
-        };
+        let left_width = player_width(available, wide);
 
         ui.horizontal_top(|ui| {
             ui.allocate_ui_with_layout(
@@ -2867,12 +3654,14 @@ impl App {
                         Sense::click(),
                     );
                     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                    // Back uses this rect to shrink the player into its card.
+                    self.last_poster = Some(poster);
                     // Once mpv has produced a frame, the video surface replaces
                     // the poster; the paint callback composites it in this rect.
                     let external = self.player.is_external();
                     let video_ready = !external && playing_this && snapshot.started;
                     if external {
-                        self.paint_thumb(ui, poster, &id, "maxres");
+                        self.paint_poster(ui, poster, &id);
                         if playing_this {
                             ui.painter().rect_filled(
                                 poster,
@@ -2943,27 +3732,39 @@ impl App {
                                 t::TEXT,
                             );
                         }
+                    } else if playing_this {
+                        // The stream is resolving. Keep the poster and say so
+                        // instead of showing transport controls for a picture
+                        // that has not arrived yet.
+                        self.paint_poster(ui, poster, &id);
+                        ui.painter().rect_filled(
+                            poster,
+                            CornerRadius::same(t::RADIUS),
+                            Color32::from_black_alpha(96),
+                        );
+                        let center = poster.center();
+                        let pill = Rect::from_center_size(center, Vec2::new(104.0, 30.0));
+                        ui.painter().rect_filled(
+                            pill,
+                            CornerRadius::same(15),
+                            Color32::from_black_alpha(190),
+                        );
+                        ui.painter().text(
+                            center,
+                            Align2::CENTER_CENTER,
+                            "Starting…",
+                            t::medium(11.5),
+                            t::TEXT,
+                        );
                     } else {
-                        self.paint_thumb(ui, poster, &id, "maxres");
-                        if playing_this {
-                            ui.painter().rect_filled(
-                                poster,
-                                CornerRadius::same(t::RADIUS),
-                                Color32::from_black_alpha(96),
-                            );
-                        }
+                        self.paint_poster(ui, poster, &id);
                         let center = poster.center();
                         ui.painter()
                             .circle_filled(center, 30.0, Color32::from_black_alpha(190));
-                        let icon = if playing_this && !snapshot.paused {
-                            t::Icon::Pause
-                        } else {
-                            t::Icon::Play
-                        };
                         t::paint_icon(
                             ui.painter(),
                             Rect::from_center_size(center, Vec2::splat(34.0)),
-                            &icon,
+                            &t::Icon::Play,
                             t::TEXT,
                         );
                     }
@@ -3070,7 +3871,9 @@ impl App {
                     } else {
                         ui.label(
                             RichText::new(if playing_this {
-                                if snapshot.paused {
+                                if !snapshot.started {
+                                    "Starting player…"
+                                } else if snapshot.paused {
                                     "Paused — click the video to resume"
                                 } else {
                                     "Playing in RustTube"
@@ -3143,7 +3946,9 @@ impl App {
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             for video in related.iter().take(20) {
-                                self.related_row(ui, video);
+                                if let Some(thumb) = self.related_row(ui, video) {
+                                    self.begin_open(video.id.clone(), thumb);
+                                }
                             }
                         });
                 });
@@ -3151,10 +3956,11 @@ impl App {
         });
     }
 
-    fn related_row(&mut self, ui: &mut Ui, video: &VideoCard) {
+    fn related_row(&mut self, ui: &mut Ui, video: &VideoCard) -> Option<Rect> {
         let width = ui.available_width();
         let mut open_title = false;
         let mut thumb_hovered = false;
+        let mut thumb_rect = Rect::NOTHING;
         let response = ui
             .allocate_ui_with_layout(
                 Vec2::new(width, 74.0),
@@ -3162,6 +3968,7 @@ impl App {
                 |ui| {
                     let (thumb, thumb_response) =
                         ui.allocate_exact_size(Vec2::new(128.0, 72.0), Sense::hover());
+                    thumb_rect = thumb;
                     self.paint_thumb(ui, thumb, &video.id, "mq");
                     thumb_hovered = thumb_response.hovered();
                     if self.preview_id.as_deref() == Some(video.id.as_str()) {
@@ -3212,7 +4019,9 @@ impl App {
         }
         let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
         if response.interact(Sense::click()).clicked() || open_title {
-            self.navigate(Route::Watch(video.id.clone()));
+            Some(thumb_rect)
+        } else {
+            None
         }
     }
 
@@ -3266,6 +4075,7 @@ impl App {
                 for item in &items {
                     let mut open_title = false;
                     let mut thumb_hovered = false;
+                    let mut thumb_rect = Rect::NOTHING;
                     let width = ui.available_width();
                     let response = ui
                         .allocate_ui_with_layout(
@@ -3274,6 +4084,7 @@ impl App {
                             |ui| {
                                 let (thumb, thumb_response) =
                                     ui.allocate_exact_size(Vec2::new(132.0, 74.0), Sense::hover());
+                                thumb_rect = thumb;
                                 self.paint_thumb(ui, thumb, &item.video_id, "mq");
                                 thumb_hovered = thumb_response.hovered();
                                 if self.preview_id.as_deref() == Some(item.video_id.as_str()) {
@@ -3353,7 +4164,7 @@ impl App {
                     if (response.interact(Sense::click()).clicked() || open_title)
                         && remove.is_none()
                     {
-                        self.navigate(Route::Watch(item.video_id.clone()));
+                        self.begin_open(item.video_id.clone(), thumb_rect);
                     }
                     ui.separator();
                 }
@@ -3674,6 +4485,84 @@ impl App {
                         RichText::new("Changes apply when you save settings.")
                             .size(11.0)
                             .color(t::DIM_2),
+                    );
+                });
+
+                ui.add_space(14.0);
+
+                // Interface
+                t::card_frame().show(ui, |ui| {
+                    ui.label(RichText::new("Interface").size(14.5).strong());
+                    ui.label(
+                        RichText::new("Small behaviours that change how the app feels.")
+                            .size(11.8)
+                            .color(t::DIM_2),
+                    );
+                    ui.add_space(10.0);
+                    let mut hover = self.settings.sidebar_hover;
+                    if ui.checkbox(&mut hover, "Reveal the sidebar on hover").changed() {
+                        self.settings.sidebar_hover = hover;
+                        self.sidebar_hover = hover;
+                        if !hover {
+                            self.sidebar_reveal = if self.sidebar_visible { 1.0 } else { 0.0 };
+                        }
+                        let _ = self.with_db(|conn| {
+                            db::set_setting(conn, "sidebar_hover", if hover { "1" } else { "0" })
+                        });
+                    }
+                    ui.label(
+                        RichText::new(
+                            "Slides in when the pointer touches the left edge. The top-bar button then pins it open.",
+                        )
+                        .size(11.0)
+                        .color(t::DIM_2),
+                    );
+                    ui.add_space(8.0);
+                    let mut zoom = self.settings.watch_zoom;
+                    if ui
+                        .checkbox(&mut zoom, "Expand the thumbnail into the player")
+                        .changed()
+                    {
+                        self.settings.watch_zoom = zoom;
+                        self.watch_zoom = zoom;
+                        if !zoom {
+                            self.opening = None;
+                            self.closing = None;
+                        }
+                        let _ = self.with_db(|conn| {
+                            db::set_setting(conn, "watch_zoom", if zoom { "1" } else { "0" })
+                        });
+                    }
+                    ui.label(
+                        RichText::new(
+                            "Opening a video grows the thumbnail you clicked into the player instead of cutting.",
+                        )
+                        .size(11.0)
+                        .color(t::DIM_2),
+                    );
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("Animation speed").size(12.0).color(t::DIM));
+                    ui.horizontal(|ui| {
+                        for (preset, label) in
+                            [("slow", "Slow"), ("normal", "Normal"), ("fast", "Fast")]
+                        {
+                            let selected = self.settings.anim_speed == preset;
+                            if ui.selectable_label(selected, label).clicked() && !selected {
+                                self.set_anim_speed(preset);
+                            }
+                        }
+                        if self.settings.anim_speed != "normal"
+                            && t::quiet_button(ui, "Reset").clicked()
+                        {
+                            self.set_anim_speed("normal");
+                        }
+                    });
+                    ui.label(
+                        RichText::new(
+                            "Controls the sidebar slide and the video open/close transitions. Normal is the default.",
+                        )
+                        .size(11.0)
+                        .color(t::DIM_2),
                     );
                 });
 
@@ -4074,8 +4963,8 @@ impl App {
                         Vec2::new(card_width, row_height),
                         Layout::top_down(Align::Min),
                         |ui| {
-                            if self.card(ui, &card, card_width) {
-                                self.navigate(Route::Watch(card.id.clone()));
+                            if let Some(thumb) = self.card(ui, &card, card_width) {
+                                self.begin_open(card.id.clone(), thumb);
                             }
                         },
                     );
@@ -4092,7 +4981,7 @@ impl App {
         {
             return;
         }
-        let (space, k, j, l, left, right, up, down, m, o, p) = ctx.input(|input| {
+        let (space, k, j, l, left, right, up, down, m, o, p, f) = ctx.input(|input| {
             (
                 input.key_pressed(egui::Key::Space),
                 input.key_pressed(egui::Key::K),
@@ -4105,6 +4994,7 @@ impl App {
                 input.key_pressed(egui::Key::M),
                 input.key_pressed(egui::Key::O),
                 input.key_pressed(egui::Key::P),
+                input.key_pressed(egui::Key::F),
             )
         });
         if space || k {
@@ -4141,6 +5031,9 @@ impl App {
         if p {
             self.set_speed(self.player.speed + 0.25);
         }
+        if f {
+            self.toggle_fullscreen(ctx);
+        }
     }
 
     fn preview_badge(&self, ui: &Ui, thumb: Rect) {
@@ -4165,16 +5058,27 @@ impl App {
             .galley(rect.min + padding, galley, t::TEXT);
     }
 
-    fn card(&mut self, ui: &mut Ui, card: &VideoCard, width: f32) -> bool {
+    fn card(&mut self, ui: &mut Ui, card: &VideoCard, width: f32) -> Option<Rect> {
         let height = (width * 0.5625).round();
         let (thumb, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
         let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
-        self.paint_thumb(ui, thumb, &card.id, "mq");
-        let previewing = self.preview_id.as_deref() == Some(card.id.as_str());
+        // The card being opened has already lifted off the page; leave an empty
+        // cell so only the travelling image is visible.
+        let lifted = self
+            .opening
+            .as_ref()
+            .is_some_and(|open| open.card.id == card.id);
+        if lifted {
+            ui.painter()
+                .rect_filled(thumb, CornerRadius::same(t::RADIUS), t::PANEL_2);
+        } else {
+            self.paint_thumb(ui, thumb, &card.id, "mq");
+        }
+        let previewing = !lifted && self.preview_id.as_deref() == Some(card.id.as_str());
         if previewing {
             self.preview.paint(ui, thumb);
         }
-        if response.hovered() {
+        if response.hovered() && !lifted {
             self.prefetch_hover(&card.id);
             self.hover_now = Some((
                 card.id.clone(),
@@ -4239,7 +5143,11 @@ impl App {
         );
         ui.add(egui::Label::new(RichText::new(subtitle).font(t::regular(12.5)).color(t::DIM)).truncate());
 
-        response.clicked() || title.clicked()
+        if response.clicked() || title.clicked() {
+            Some(thumb)
+        } else {
+            None
+        }
     }
 
     /// Debounced channel lookup for the quick-select dropdown.
@@ -4493,23 +5401,55 @@ impl eframe::App for App {
         }
         self.tick_suggestions();
         self.player_shortcuts(ctx);
-
-        self.hover_now = None;
-        self.top_bar(ctx);
-        if self.sidebar_visible {
-            self.side_bar(ctx);
+        if ctx.input(|input| input.pointer.delta() != Vec2::ZERO) {
+            self.last_pointer_move = Instant::now();
         }
 
+        self.sync_fullscreen(ctx);
+        self.advance_opening();
+        self.advance_closing();
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            if self.opening.is_some() {
+                self.cancel_opening();
+            } else if self.fullscreen {
+                // Fullscreen must always be escapable, even if playback stopped
+                // and the player-only shortcut path is no longer active.
+                self.toggle_fullscreen(ctx);
+            }
+        }
+        self.hover_now = None;
+        self.animate_sidebar(ctx);
+        let immersive = self.fullscreen && self.can_go_fullscreen();
+        if !immersive {
+            self.top_bar(ctx);
+            if self.sidebar_hover && !self.sidebar_visible {
+                self.hover_drawer(ctx);
+            } else if self.sidebar_visible {
+                self.side_bar(ctx);
+            }
+            self.sidebar_grip(ctx);
+        }
+
+        // Immersive mode owns the whole window: no inner margin, no page
+        // background, just black so the video can go edge to edge.
+        let frame = if immersive {
+            egui::Frame::NONE.fill(Color32::BLACK)
+        } else {
+            egui::Frame::NONE.fill(t::BG).inner_margin(Margin {
+                left: 24,
+                right: 0,
+                top: 20,
+                bottom: 20,
+            })
+        };
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::NONE.fill(t::BG).inner_margin(Margin {
-                    left: 24,
-                    right: 0,
-                    top: 20,
-                    bottom: 20,
-                }),
-            )
+            .frame(frame)
             .show(ctx, |ui| {
+                self.page_rect = Some(ui.max_rect());
+                if immersive {
+                    self.fullscreen_view(ui);
+                    return;
+                }
                 let default_scroll = ui.style().spacing.scroll;
                 // Put only the page scrollbar on the window edge. The inner
                 // margin keeps the page clear of it; nested scroll areas get
@@ -4525,6 +5465,26 @@ impl eframe::App for App {
                         // Keep full-width cards and right-aligned controls clear
                         // of the window edge; the page scrollbar stays outside.
                         ui.set_width((ui.available_width() - 20.0).max(0.0));
+                        // Opening pushes this page down and out of the way
+                        // while the image travels to the player; closing is the
+                        // same motion backwards, with the destination page
+                        // already on screen and sliding back into place.
+                        let transition = if self.opening.is_some() {
+                            Some((t::ease_out_cubic(self.opening_progress()), true))
+                        } else if self.closing.is_some() {
+                            Some((t::smoothstep(self.closing_progress()), false))
+                        } else {
+                            None
+                        };
+                        if let Some((progress, opening)) = transition {
+                            let (pushed, opacity) = page_shift(progress, opening);
+                            let height = self
+                                .page_rect
+                                .map(|rect| rect.height())
+                                .unwrap_or(600.0);
+                            ui.add_space(height * 0.55 * pushed);
+                            ui.set_opacity(opacity);
+                        }
                         match self.route.clone() {
                             Route::Trending => self.view_trending(ui),
                             Route::Search(query, page) => self.view_search(ui, query, page),
@@ -4536,8 +5496,27 @@ impl eframe::App for App {
                             Route::Settings => self.view_settings(ui),
                         }
                     });
+                if self.closing.is_some() {
+                    // Swallow clicks while the page is leaving, so a stray click
+                    // cannot navigate somewhere the motion is not accounting for.
+                    ui.interact(
+                        ui.max_rect(),
+                        egui::Id::new("closing-block"),
+                        Sense::click_and_drag(),
+                    );
+                }
             });
 
+        // Neither transition should trigger hover previews over content that is
+        // sliding away or already covered.
+        if self.opening.is_some() || self.closing.is_some() {
+            self.hover_now = None;
+        }
+        self.draw_opening(ctx);
+        self.draw_closing(ctx);
+        if self.fullscreen && self.last_pointer_move.elapsed() > Duration::from_millis(1500) {
+            ctx.set_cursor_icon(egui::CursorIcon::None);
+        }
         self.sync_hover_preview();
         self.suggestions_layer(ctx);
         self.toast_layer(ctx);
@@ -4548,6 +5527,117 @@ impl eframe::App for App {
         self.player.quit();
         self.preview.quit();
     }
+}
+
+/// The route only swaps after the motion has had its full duration.
+fn transition_finished(elapsed: f32, duration: f32) -> bool {
+    elapsed >= duration
+}
+
+/// Page push and dimming for a card transition. Opening pushes the source page
+/// down and fades it out; closing runs the same state backwards so the
+/// destination page slides back up and brightens as the poster shrinks into it.
+fn page_shift(progress: f32, opening: bool) -> (f32, f32) {
+    let pushed = if opening { progress } else { 1.0 - progress }.clamp(0.0, 1.0);
+    (pushed, 1.0 - 0.72 * pushed)
+}
+
+/// Paint a texture with rounded corners into a specific layer. `Painter::image`
+/// only draws square quads, so the shared card does this through `Image`.
+fn paint_rounded_image(
+    ctx: &egui::Context,
+    layer: egui::LayerId,
+    id: egui::Id,
+    rect: Rect,
+    texture: &egui::TextureHandle,
+    radius: u8,
+) {
+    let ui = egui::Ui::new(
+        ctx.clone(),
+        id,
+        egui::UiBuilder::new().layer_id(layer).max_rect(rect),
+    );
+    egui::Image::from_texture(egui::load::SizedTexture::from_handle(texture))
+        .corner_radius(CornerRadius::same(radius))
+        .paint_at(&ui, rect);
+}
+
+/// Width of the video column inside the page. Shared by the watch layout and
+/// the opening animation so the two can never disagree.
+fn player_width(available: f32, wide: bool) -> f32 {
+    if wide {
+        available
+    } else {
+        (available * 0.64).max(320.0).min((available - 300.0).max(320.0))
+    }
+}
+
+/// Cover the incoming page for a shared-element transition, so the finished
+/// layout is not already visible behind the image as it travels.
+/// Animation-speed presets. Unknown or missing values fall back to the
+/// original timing, so an old database behaves exactly as before.
+fn anim_preset(value: &str) -> &'static str {
+    match value.trim() {
+        "slow" => "slow",
+        "fast" => "fast",
+        _ => "normal",
+    }
+}
+
+fn anim_scale(preset: &str) -> f32 {
+    match anim_preset(preset) {
+        "slow" => 1.65,
+        "fast" => 0.55,
+        _ => 1.0,
+    }
+}
+
+/// Where the sidebar reveal should settle this frame: pinned open, revealed by
+/// the pointer at the left edge, or tucked away.
+fn sidebar_target(
+    pinned: bool,
+    hover_mode: bool,
+    reveal: f32,
+    pointer: Option<egui::Pos2>,
+    screen: Rect,
+) -> f32 {
+    if pinned {
+        return 1.0;
+    }
+    if !hover_mode {
+        return 0.0;
+    }
+    let Some(pos) = pointer else {
+        return 0.0;
+    };
+    let hot = Rect::from_min_max(
+        egui::pos2(screen.left(), screen.top()),
+        egui::pos2(screen.left() + SIDEBAR_HOT_ZONE, screen.bottom()),
+    );
+    if hot.contains(pos) {
+        return 1.0;
+    }
+    // Once it has started to open, the whole sidebar column keeps it open, so
+    // a pointer that outruns the slide cannot make it snap shut again.
+    if reveal > 0.01 && pos.x < screen.left() + t::SIDEBAR_WIDTH {
+        return 1.0;
+    }
+    0.0
+}
+
+/// True when the next channel page should already be on its way: the end of
+/// the loaded grid is close to the bottom of the viewport.
+fn wants_more_page(
+    viewport_bottom: f32,
+    content_bottom: f32,
+    loading: bool,
+    exhausted: bool,
+    page: u32,
+) -> bool {
+    !loading
+        && !exhausted
+        && page < CHANNEL_PAGE_LIMIT
+        && content_bottom - viewport_bottom < CHANNEL_PREFETCH_DISTANCE
 }
 
 #[cfg(test)]
@@ -4562,6 +5652,130 @@ mod tests {
         assert_eq!(App::preview_start(600), 30.0);
         assert_eq!(App::preview_start(0), 5.0);
         assert_eq!(App::preview_start(-1), 5.0);
+    }
+
+    #[test]
+    fn player_width_matches_the_watch_layout() {
+        // Wide mode uses everything.
+        assert_eq!(player_width(1000.0, true), 1000.0);
+        // Normal mode is 64 %, but never below 320 and never leaving less than
+        // 300 px for the related rail.
+        assert!((player_width(1440.0, false) - 921.6).abs() < 0.01);
+        assert_eq!(player_width(500.0, false), 320.0);
+        assert_eq!(player_width(400.0, false), 320.0);
+        // A page that cannot fit the rail still yields a usable player.
+        assert!(player_width(600.0, false) >= 320.0);
+    }
+
+    #[test]
+    fn closing_page_shift_is_the_open_in_reverse() {
+        let close = |(push, opacity): (f32, f32), push_expected: f32, opacity_expected: f32| {
+            assert!((push - push_expected).abs() < 1e-5, "push {push}");
+            assert!(
+                (opacity - opacity_expected).abs() < 1e-5,
+                "opacity {opacity}"
+            );
+        };
+        close(page_shift(0.0, true), 0.0, 1.0);
+        close(page_shift(1.0, true), 1.0, 0.28);
+        close(page_shift(0.0, false), 1.0, 0.28);
+        close(page_shift(1.0, false), 0.0, 1.0);
+        for step in 0..=10 {
+            let p = step as f32 / 10.0;
+            let open = page_shift(p, true);
+            let close = page_shift(1.0 - p, false);
+            assert!((open.0 - close.0).abs() < 1e-6);
+            assert!((open.1 - close.1).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn the_route_swaps_only_after_the_full_motion() {
+        assert!(!transition_finished(0.31, 0.32));
+        assert!(!transition_finished(0.0, 0.32));
+        assert!(transition_finished(0.32, 0.32));
+        assert!(transition_finished(0.9, 0.32));
+        // Slow mode stretches the same check, so it swaps later, not earlier.
+        assert_eq!(anim_scale("slow") * 0.32, 0.528);
+        assert!(!transition_finished(0.32, anim_scale("slow") * 0.32));
+    }
+
+    #[test]
+    fn animation_presets_scale_around_the_default() {
+        assert_eq!(anim_scale("normal"), 1.0);
+        // Missing or stale values must not change the original timing.
+        assert_eq!(anim_scale(""), 1.0);
+        assert_eq!(anim_scale("turbo"), 1.0);
+        assert!(anim_scale("slow") > 1.0);
+        assert!(anim_scale("fast") < 1.0);
+        assert_eq!(anim_preset("fast"), "fast");
+        assert_eq!(anim_preset(" slow "), "slow");
+    }
+
+    #[test]
+    fn sidebar_target_follows_pin_and_pointer() {
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(1200.0, 800.0));
+        // Pinning always wins.
+        assert_eq!(sidebar_target(true, true, 0.0, None, screen), 1.0);
+        assert_eq!(sidebar_target(true, false, 0.0, None, screen), 1.0);
+        // Classic mode never reveals on hover.
+        assert_eq!(
+            sidebar_target(false, false, 0.0, Some(egui::pos2(2.0, 400.0)), screen),
+            0.0
+        );
+        // Hover mode: the whole hot zone reveals, just past it does not.
+        for x in [0.0, 8.0, 20.0, SIDEBAR_HOT_ZONE] {
+            assert_eq!(
+                sidebar_target(false, true, 0.0, Some(egui::pos2(x, 400.0)), screen),
+                1.0,
+                "x = {x} should arm the drawer"
+            );
+        }
+        assert_eq!(
+            sidebar_target(
+                false,
+                true,
+                0.0,
+                Some(egui::pos2(SIDEBAR_HOT_ZONE + 1.0, 400.0)),
+                screen
+            ),
+            0.0
+        );
+        assert_eq!(
+            sidebar_target(false, true, 0.0, Some(egui::pos2(200.0, 400.0)), screen),
+            0.0
+        );
+        assert_eq!(
+            sidebar_target(false, true, 0.0, Some(egui::pos2(600.0, 400.0)), screen),
+            0.0
+        );
+        // Hovering the open panel keeps it open, but only once it is out.
+        let panel = egui::pos2(120.0, 400.0);
+        assert_eq!(sidebar_target(false, true, 0.8, Some(panel), screen), 1.0);
+        // Once open, the whole column keeps it open.
+        assert_eq!(sidebar_target(false, true, 0.1, Some(panel), screen), 1.0);
+        // Closed: hovering the content area does nothing.
+        assert_eq!(sidebar_target(false, true, 0.0, Some(panel), screen), 0.0);
+        // No pointer (window unfocused) settles hidden.
+        assert_eq!(sidebar_target(false, true, 0.8, None, screen), 0.0);
+    }
+
+    #[test]
+    fn channel_prefetch_waits_until_the_end_is_near() {
+        // Content far below the viewport: nothing to do yet.
+        assert!(!wants_more_page(1000.0, 4000.0, false, false, 1));
+        // Within two card rows of the end.
+        assert!(wants_more_page(1000.0, 1500.0, false, false, 1));
+        // Never while a page is in flight, when exhausted, or at the cap.
+        assert!(!wants_more_page(1000.0, 1100.0, true, false, 1));
+        assert!(!wants_more_page(1000.0, 1100.0, false, true, 1));
+        assert!(!wants_more_page(
+            1000.0,
+            1100.0,
+            false,
+            false,
+            CHANNEL_PAGE_LIMIT
+        ));
     }
 }
 

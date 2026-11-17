@@ -29,7 +29,15 @@ area, and a player bar pinned to the bottom once something is playing.
 | Watch | Two-row player controls, title, likes, description, related rail |
 | History | Resume points, per-item progress, remove and clear |
 | Statistics | Total/weekly watch time, videos opened, streak, 30-day chart, top channels |
-| Settings | Playback defaults, instance, region, history, cloud sync, local data |
+| Settings | Playback defaults, interface options, instance, region, history, cloud sync, local data |
+
+Settings > Interface has two optional transitions: the sidebar can reveal itself
+when the pointer touches the left edge (the top-bar button then pins it open),
+and opening a video can grow the clicked thumbnail into the player instead of
+cutting to the new page. Animation speed (Slow / Normal / Fast) scales both the
+sidebar slide and the video open/close transitions; Normal is the default and
+Reset returns to it. Channel pages load their next page as you approach the end
+of the grid, so there is no button to press.
 
 ## Playback
 
@@ -93,6 +101,8 @@ Shortcuts are ignored while a text field has the keyboard.
 | Up, Down | Volume ±5 |
 | M | Mute/unmute |
 | O, P | Speed down/up |
+| F | Fullscreen (the player bar has the same button) |
+| Esc | Leave fullscreen |
 
 ## Run it
 
