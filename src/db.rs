@@ -12,7 +12,23 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-pub const SYNC_VERSION: u32 = 1;
+pub const SYNC_VERSION: u32 = 2;
+
+/// Preferences that follow you to other machines. Device-specific state
+/// (volume, player path, sync credentials, device id) deliberately stays local.
+pub const SYNCED_SETTINGS: &[&str] = &[
+    "region",
+    "playback",
+    "wide_player",
+    "playback_speed",
+    "quality",
+    "previews",
+    "sidebar_visible",
+    "sidebar_hover",
+    "watch_zoom",
+    "anim_speed",
+    "history_enabled",
+];
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Subscription {
@@ -64,6 +80,69 @@ pub struct WatchStat {
     pub videos: i64,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SavedEntry {
+    pub video_id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub channel_id: String,
+    #[serde(default)]
+    pub channel_name: String,
+    #[serde(default)]
+    pub duration: i64,
+    #[serde(default)]
+    pub saved_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+    #[serde(default)]
+    pub deleted: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct Playlist {
+    pub playlist_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+    #[serde(default)]
+    pub deleted: bool,
+    /// Computed locally for display; not meaningful in a sync payload.
+    #[serde(default)]
+    pub item_count: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct PlaylistItem {
+    pub playlist_id: String,
+    pub video_id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub channel_id: String,
+    #[serde(default)]
+    pub channel_name: String,
+    #[serde(default)]
+    pub duration: i64,
+    #[serde(default)]
+    pub added_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+    #[serde(default)]
+    pub deleted: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SyncedSetting {
+    pub key: String,
+    pub value: String,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct SyncPayload {
     #[serde(default)]
@@ -78,6 +157,14 @@ pub struct SyncPayload {
     pub history: Vec<HistoryEntry>,
     #[serde(default)]
     pub watch_stats: Vec<WatchStat>,
+    #[serde(default)]
+    pub saved: Vec<SavedEntry>,
+    #[serde(default)]
+    pub playlists: Vec<Playlist>,
+    #[serde(default)]
+    pub playlist_items: Vec<PlaylistItem>,
+    #[serde(default)]
+    pub settings: Vec<SyncedSetting>,
 }
 
 #[derive(Serialize, Default, Debug)]
@@ -86,6 +173,10 @@ pub struct MergeReport {
     pub subscriptions: usize,
     pub history: usize,
     pub watch_stats: usize,
+    pub saved: usize,
+    pub playlists: usize,
+    pub playlist_items: usize,
+    pub settings: usize,
 }
 
 #[derive(Serialize, Clone)]
@@ -174,7 +265,57 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
             PRIMARY KEY (day, device_id, channel_id)
         );
 
-        PRAGMA user_version = 1;
+        CREATE TABLE IF NOT EXISTS video_watch (
+            video_id     TEXT NOT NULL,
+            day          TEXT NOT NULL,
+            device_id    TEXT NOT NULL,
+            channel_id   TEXT NOT NULL DEFAULT '',
+            channel_name TEXT NOT NULL DEFAULT '',
+            seconds      INTEGER NOT NULL DEFAULT 0,
+            videos       INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (video_id, day, device_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS saved (
+            video_id     TEXT PRIMARY KEY,
+            title        TEXT NOT NULL DEFAULT '',
+            channel_id   TEXT NOT NULL DEFAULT '',
+            channel_name TEXT NOT NULL DEFAULT '',
+            duration     INTEGER NOT NULL DEFAULT 0,
+            saved_at     INTEGER NOT NULL DEFAULT 0,
+            updated_at   INTEGER NOT NULL DEFAULT 0,
+            deleted      INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS playlists (
+            playlist_id TEXT PRIMARY KEY,
+            name        TEXT NOT NULL DEFAULT '',
+            created_at  INTEGER NOT NULL DEFAULT 0,
+            updated_at  INTEGER NOT NULL DEFAULT 0,
+            deleted     INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS playlist_items (
+            playlist_id  TEXT NOT NULL,
+            video_id     TEXT NOT NULL,
+            title        TEXT NOT NULL DEFAULT '',
+            channel_id   TEXT NOT NULL DEFAULT '',
+            channel_name TEXT NOT NULL DEFAULT '',
+            duration     INTEGER NOT NULL DEFAULT 0,
+            added_at     INTEGER NOT NULL DEFAULT 0,
+            updated_at   INTEGER NOT NULL DEFAULT 0,
+            deleted      INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (playlist_id, video_id)
+        );
+
+        -- When each synced preference was last changed here, so a merge can tell
+        -- a real edit from another machine's default.
+        CREATE TABLE IF NOT EXISTS settings_meta (
+            key        TEXT PRIMARY KEY,
+            updated_at INTEGER NOT NULL DEFAULT 0
+        );
+
+        PRAGMA user_version = 2;
         "#,
     )
 }
@@ -192,6 +333,13 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> rusqlite::Resul
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         params![key, value],
     )?;
+    if SYNCED_SETTINGS.contains(&key) {
+        conn.execute(
+            "INSERT INTO settings_meta(key, updated_at) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET updated_at = excluded.updated_at",
+            params![key, now_ms()],
+        )?;
+    }
     Ok(())
 }
 
@@ -338,6 +486,8 @@ pub fn record_watch(conn: &Connection, update: &WatchUpdate<'_>) -> rusqlite::Re
     if update.seconds > 0 || update.new_view {
         let seconds = update.seconds.max(0);
         let videos = if update.new_view { 1 } else { 0 };
+        let day = today_local();
+        let device = device_id(conn)?;
         conn.execute(
             "INSERT INTO watch_stats(day, device_id, channel_id, channel_name, seconds, videos)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6)
@@ -347,8 +497,28 @@ pub fn record_watch(conn: &Connection, update: &WatchUpdate<'_>) -> rusqlite::Re
                 channel_name = CASE WHEN excluded.channel_name <> '' THEN excluded.channel_name
                                     ELSE watch_stats.channel_name END",
             params![
-                today_local(),
-                device_id(conn)?,
+                &day,
+                &device,
+                update.channel_id,
+                update.channel_name,
+                seconds,
+                videos
+            ],
+        )?;
+        // Per-video copy of this device's contribution, so deleting the video
+        // from history can take exactly that time back out of the totals.
+        conn.execute(
+            "INSERT INTO video_watch(video_id, day, device_id, channel_id, channel_name, seconds, videos)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(video_id, day, device_id) DO UPDATE SET
+                seconds      = video_watch.seconds + excluded.seconds,
+                videos       = video_watch.videos + excluded.videos,
+                channel_name = CASE WHEN excluded.channel_name <> '' THEN excluded.channel_name
+                                    ELSE video_watch.channel_name END",
+            params![
+                update.video_id,
+                &day,
+                &device,
                 update.channel_id,
                 update.channel_name,
                 seconds,
@@ -400,6 +570,35 @@ pub fn list_history(conn: &Connection, limit: i64) -> Vec<HistoryEntry> {
 }
 
 pub fn delete_history_item(conn: &Connection, video_id: &str) -> rusqlite::Result<()> {
+    let device = device_id(conn)?;
+    let rows: Vec<(String, String, i64, i64)> = match conn.prepare(
+        "SELECT day, channel_id, seconds, videos FROM video_watch
+         WHERE video_id = ?1 AND device_id = ?2",
+    ) {
+        Ok(mut stmt) => stmt
+            .query_map(params![video_id, &device], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    for (day, channel_id, seconds, videos) in rows {
+        conn.execute(
+            "UPDATE watch_stats
+             SET seconds = MAX(seconds - ?4, 0), videos = MAX(videos - ?5, 0)
+             WHERE day = ?1 AND device_id = ?2 AND channel_id = ?3",
+            params![day, &device, channel_id, seconds, videos],
+        )?;
+    }
+    conn.execute(
+        "DELETE FROM watch_stats WHERE seconds <= 0 AND videos <= 0",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM video_watch WHERE video_id = ?1 AND device_id = ?2",
+        params![video_id, &device],
+    )?;
     conn.execute(
         "UPDATE history SET deleted = 1, updated_at = ?2 WHERE video_id = ?1",
         params![video_id, now_ms()],
@@ -417,7 +616,221 @@ pub fn clear_history(conn: &Connection) -> rusqlite::Result<()> {
 
 pub fn reset_watch_stats(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM watch_stats", [])?;
+    conn.execute("DELETE FROM video_watch", [])?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------- saved
+
+pub fn is_saved(conn: &Connection, video_id: &str) -> bool {
+    conn.query_row(
+        "SELECT deleted FROM saved WHERE video_id = ?1",
+        params![video_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .map(|deleted| deleted == 0)
+    .unwrap_or(false)
+}
+
+pub fn set_saved(
+    conn: &Connection,
+    video_id: &str,
+    title: &str,
+    channel_id: &str,
+    channel_name: &str,
+    duration: i64,
+    save: bool,
+) -> rusqlite::Result<bool> {
+    let now = now_ms();
+    if save {
+        conn.execute(
+            "INSERT INTO saved(video_id, title, channel_id, channel_name, duration, saved_at, updated_at, deleted)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?6, 0)
+             ON CONFLICT(video_id) DO UPDATE SET
+                title        = excluded.title,
+                channel_id   = excluded.channel_id,
+                channel_name = excluded.channel_name,
+                duration     = excluded.duration,
+                saved_at     = CASE WHEN saved.deleted = 1 THEN excluded.saved_at
+                                    ELSE saved.saved_at END,
+                updated_at   = MAX(excluded.updated_at, saved.updated_at + 1),
+                deleted      = 0",
+            params![video_id, title, channel_id, channel_name, duration, now],
+        )?;
+        Ok(true)
+    } else {
+        conn.execute(
+            "UPDATE saved SET deleted = 1, updated_at = MAX(?2, updated_at + 1)
+             WHERE video_id = ?1",
+            params![video_id, now],
+        )?;
+        Ok(false)
+    }
+}
+
+pub fn list_saved(conn: &Connection, limit: i64) -> Vec<SavedEntry> {
+    let mut stmt = match conn.prepare(
+        "SELECT video_id, title, channel_id, channel_name, duration, saved_at, updated_at, deleted
+         FROM saved WHERE deleted = 0 ORDER BY saved_at DESC LIMIT ?1",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return Vec::new(),
+    };
+    let rows = stmt.query_map(params![limit], |row| {
+        Ok(SavedEntry {
+            video_id: row.get(0)?,
+            title: row.get(1)?,
+            channel_id: row.get(2)?,
+            channel_name: row.get(3)?,
+            duration: row.get(4)?,
+            saved_at: row.get(5)?,
+            updated_at: row.get(6)?,
+            deleted: row.get::<_, i64>(7)? != 0,
+        })
+    });
+    match rows {
+        Ok(iter) => iter.filter_map(Result::ok).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+// ------------------------------------------------------------------ playlists
+
+pub fn create_playlist(conn: &Connection, name: &str) -> rusqlite::Result<String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = now_ms();
+    conn.execute(
+        "INSERT INTO playlists(playlist_id, name, created_at, updated_at, deleted)
+         VALUES(?1, ?2, ?3, ?3, 0)",
+        params![id, name.trim(), now],
+    )?;
+    Ok(id)
+}
+
+pub fn list_playlists(conn: &Connection) -> Vec<Playlist> {
+    let mut stmt = match conn.prepare(
+        "SELECT p.playlist_id, p.name, p.created_at, p.updated_at, p.deleted,
+                (SELECT COUNT(*) FROM playlist_items i
+                 WHERE i.playlist_id = p.playlist_id AND i.deleted = 0)
+         FROM playlists p WHERE p.deleted = 0
+         ORDER BY p.created_at ASC",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return Vec::new(),
+    };
+    let rows = stmt.query_map([], |row| {
+        Ok(Playlist {
+            playlist_id: row.get(0)?,
+            name: row.get(1)?,
+            created_at: row.get(2)?,
+            updated_at: row.get(3)?,
+            deleted: row.get::<_, i64>(4)? != 0,
+            item_count: row.get(5)?,
+        })
+    });
+    match rows {
+        Ok(iter) => iter.filter_map(Result::ok).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+pub fn delete_playlist(conn: &Connection, playlist_id: &str) -> rusqlite::Result<()> {
+    let now = now_ms();
+    conn.execute(
+        "UPDATE playlists SET deleted = 1, updated_at = MAX(?2, updated_at + 1)
+         WHERE playlist_id = ?1",
+        params![playlist_id, now],
+    )?;
+    conn.execute(
+        "UPDATE playlist_items SET deleted = 1, updated_at = MAX(?2, updated_at + 1)
+         WHERE playlist_id = ?1 AND deleted = 0",
+        params![playlist_id, now],
+    )?;
+    Ok(())
+}
+
+pub fn add_to_playlist(
+    conn: &Connection,
+    playlist_id: &str,
+    video_id: &str,
+    title: &str,
+    channel_id: &str,
+    channel_name: &str,
+    duration: i64,
+) -> rusqlite::Result<()> {
+    let now = now_ms();
+    conn.execute(
+        "INSERT INTO playlist_items(playlist_id, video_id, title, channel_id, channel_name, duration, added_at, updated_at, deleted)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 0)
+         ON CONFLICT(playlist_id, video_id) DO UPDATE SET
+            title        = excluded.title,
+            channel_id   = excluded.channel_id,
+            channel_name = excluded.channel_name,
+            duration     = excluded.duration,
+            added_at     = CASE WHEN playlist_items.deleted = 1 THEN excluded.added_at
+                                ELSE playlist_items.added_at END,
+            updated_at   = MAX(excluded.updated_at, playlist_items.updated_at + 1),
+            deleted      = 0",
+        params![playlist_id, video_id, title, channel_id, channel_name, duration, now],
+    )?;
+    Ok(())
+}
+
+pub fn remove_from_playlist(
+    conn: &Connection,
+    playlist_id: &str,
+    video_id: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE playlist_items SET deleted = 1, updated_at = MAX(?3, updated_at + 1)
+         WHERE playlist_id = ?1 AND video_id = ?2",
+        params![playlist_id, video_id, now_ms()],
+    )?;
+    Ok(())
+}
+
+pub fn is_in_playlist(conn: &Connection, playlist_id: &str, video_id: &str) -> bool {
+    conn.query_row(
+        "SELECT deleted FROM playlist_items WHERE playlist_id = ?1 AND video_id = ?2",
+        params![playlist_id, video_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .map(|deleted| deleted == 0)
+    .unwrap_or(false)
+}
+
+pub fn list_playlist_items(conn: &Connection, playlist_id: &str) -> Vec<PlaylistItem> {
+    let mut stmt = match conn.prepare(
+        "SELECT playlist_id, video_id, title, channel_id, channel_name, duration, added_at, updated_at, deleted
+         FROM playlist_items WHERE playlist_id = ?1 AND deleted = 0
+         ORDER BY added_at ASC",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return Vec::new(),
+    };
+    let rows = stmt.query_map(params![playlist_id], |row| {
+        Ok(PlaylistItem {
+            playlist_id: row.get(0)?,
+            video_id: row.get(1)?,
+            title: row.get(2)?,
+            channel_id: row.get(3)?,
+            channel_name: row.get(4)?,
+            duration: row.get(5)?,
+            added_at: row.get(6)?,
+            updated_at: row.get(7)?,
+            deleted: row.get::<_, i64>(8)? != 0,
+        })
+    });
+    match rows {
+        Ok(iter) => iter.filter_map(Result::ok).collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 // ----------------------------------------------------------------- statistics
@@ -584,6 +997,95 @@ pub fn export_payload(conn: &Connection, generated_by: &str) -> SyncPayload {
         Err(_) => Vec::new(),
     };
 
+    let saved = match conn
+        .prepare(
+            "SELECT video_id, title, channel_id, channel_name, duration, saved_at, updated_at, deleted FROM saved",
+        )
+        .and_then(|mut stmt| {
+            let rows = stmt.query_map([], |row| {
+                Ok(SavedEntry {
+                    video_id: row.get(0)?,
+                    title: row.get(1)?,
+                    channel_id: row.get(2)?,
+                    channel_name: row.get(3)?,
+                    duration: row.get(4)?,
+                    saved_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                    deleted: row.get::<_, i64>(7)? != 0,
+                })
+            })?;
+            Ok(rows.flatten().collect::<Vec<_>>())
+        }) {
+        Ok(list) => list,
+        Err(_) => Vec::new(),
+    };
+
+    let playlists = match conn
+        .prepare("SELECT playlist_id, name, created_at, updated_at, deleted FROM playlists")
+        .and_then(|mut stmt| {
+            let rows = stmt.query_map([], |row| {
+                Ok(Playlist {
+                    playlist_id: row.get(0)?,
+                    name: row.get(1)?,
+                    created_at: row.get(2)?,
+                    updated_at: row.get(3)?,
+                    deleted: row.get::<_, i64>(4)? != 0,
+                    item_count: 0,
+                })
+            })?;
+            Ok(rows.flatten().collect::<Vec<_>>())
+        }) {
+        Ok(list) => list,
+        Err(_) => Vec::new(),
+    };
+
+    let playlist_items = match conn
+        .prepare(
+            "SELECT playlist_id, video_id, title, channel_id, channel_name, duration, added_at, updated_at, deleted FROM playlist_items",
+        )
+        .and_then(|mut stmt| {
+            let rows = stmt.query_map([], |row| {
+                Ok(PlaylistItem {
+                    playlist_id: row.get(0)?,
+                    video_id: row.get(1)?,
+                    title: row.get(2)?,
+                    channel_id: row.get(3)?,
+                    channel_name: row.get(4)?,
+                    duration: row.get(5)?,
+                    added_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                    deleted: row.get::<_, i64>(8)? != 0,
+                })
+            })?;
+            Ok(rows.flatten().collect::<Vec<_>>())
+        }) {
+        Ok(list) => list,
+        Err(_) => Vec::new(),
+    };
+
+    let mut settings = Vec::new();
+    for key in SYNCED_SETTINGS {
+        let updated_at: i64 = conn
+            .query_row(
+                "SELECT updated_at FROM settings_meta WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        if updated_at > 0 {
+            if let Some(value) = get_setting(conn, key) {
+                settings.push(SyncedSetting {
+                    key: (*key).to_string(),
+                    value,
+                    updated_at,
+                });
+            }
+        }
+    }
+
     SyncPayload {
         version: SYNC_VERSION,
         generated_at: now_ms(),
@@ -591,6 +1093,10 @@ pub fn export_payload(conn: &Connection, generated_by: &str) -> SyncPayload {
         subscriptions,
         history,
         watch_stats,
+        saved,
+        playlists,
+        playlist_items,
+        settings,
     }
 }
 
@@ -688,8 +1194,126 @@ pub fn merge_payload(conn: &mut Connection, payload: &SyncPayload) -> Result<Mer
         report.watch_stats += changed;
     }
 
+    for item in &payload.saved {
+        let changed = tx
+            .execute(
+                "INSERT INTO saved(video_id, title, channel_id, channel_name, duration, saved_at, updated_at, deleted)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(video_id) DO UPDATE SET
+                    title        = excluded.title,
+                    channel_id   = excluded.channel_id,
+                    channel_name = excluded.channel_name,
+                    duration     = excluded.duration,
+                    saved_at     = excluded.saved_at,
+                    updated_at   = excluded.updated_at,
+                    deleted      = excluded.deleted
+                 WHERE excluded.updated_at > saved.updated_at",
+                params![
+                    item.video_id,
+                    item.title,
+                    item.channel_id,
+                    item.channel_name,
+                    item.duration,
+                    item.saved_at,
+                    item.updated_at,
+                    item.deleted as i64
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        report.saved += changed;
+    }
+
+    for playlist in &payload.playlists {
+        let changed = tx
+            .execute(
+                "INSERT INTO playlists(playlist_id, name, created_at, updated_at, deleted)
+                 VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(playlist_id) DO UPDATE SET
+                    name       = excluded.name,
+                    created_at = excluded.created_at,
+                    updated_at = excluded.updated_at,
+                    deleted    = excluded.deleted
+                 WHERE excluded.updated_at > playlists.updated_at",
+                params![
+                    playlist.playlist_id,
+                    playlist.name,
+                    playlist.created_at,
+                    playlist.updated_at,
+                    playlist.deleted as i64
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        report.playlists += changed;
+    }
+
+    for item in &payload.playlist_items {
+        let changed = tx
+            .execute(
+                "INSERT INTO playlist_items(playlist_id, video_id, title, channel_id, channel_name, duration, added_at, updated_at, deleted)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(playlist_id, video_id) DO UPDATE SET
+                    title        = excluded.title,
+                    channel_id   = excluded.channel_id,
+                    channel_name = excluded.channel_name,
+                    duration     = excluded.duration,
+                    added_at     = excluded.added_at,
+                    updated_at   = excluded.updated_at,
+                    deleted      = excluded.deleted
+                 WHERE excluded.updated_at > playlist_items.updated_at",
+                params![
+                    item.playlist_id,
+                    item.video_id,
+                    item.title,
+                    item.channel_id,
+                    item.channel_name,
+                    item.duration,
+                    item.added_at,
+                    item.updated_at,
+                    item.deleted as i64
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        report.playlist_items += changed;
+    }
+
+    for setting in &payload.settings {
+        if !SYNCED_SETTINGS.contains(&setting.key.as_str()) {
+            continue;
+        }
+        let local = tx
+            .query_row(
+                "SELECT updated_at FROM settings_meta WHERE key = ?1",
+                params![setting.key],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .unwrap_or(0);
+        if setting.updated_at > local {
+            tx.execute(
+                "INSERT INTO settings(key, value) VALUES(?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![setting.key, setting.value],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT INTO settings_meta(key, updated_at) VALUES(?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET updated_at = excluded.updated_at",
+                params![setting.key, setting.updated_at],
+            )
+            .map_err(|e| e.to_string())?;
+            report.settings += 1;
+        }
+    }
+
     tx.commit().map_err(|e| e.to_string())?;
-    report.records_applied = report.subscriptions + report.history + report.watch_stats;
+    report.records_applied = report.subscriptions
+        + report.history
+        + report.watch_stats
+        + report.saved
+        + report.playlists
+        + report.playlist_items
+        + report.settings;
     Ok(report)
 }
 
@@ -832,5 +1456,77 @@ mod tests {
         let mut conn = memory_db();
         let payload = SyncPayload { version: SYNC_VERSION + 1, ..Default::default() };
         assert!(merge_payload(&mut conn, &payload).is_err());
+    }
+
+    #[test]
+    fn saved_and_playlists_roundtrip_through_sync() {
+        let a = memory_db();
+        set_saved(&a, "v1", "One", "UC1", "Chan", 100, true).unwrap();
+        assert!(is_saved(&a, "v1"));
+        let list = create_playlist(&a, "Watch later").unwrap();
+        add_to_playlist(&a, &list, "v1", "One", "UC1", "Chan", 100).unwrap();
+
+        let mut b = memory_db();
+        merge_payload(&mut b, &export_payload(&a, "dev-a")).unwrap();
+        assert!(is_saved(&b, "v1"));
+        assert_eq!(list_playlists(&b)[0].item_count, 1);
+        assert_eq!(list_playlist_items(&b, &list).len(), 1);
+
+        // Removals propagate as tombstones instead of being resurrected.
+        set_saved(&a, "v1", "", "", "", 0, false).unwrap();
+        remove_from_playlist(&a, &list, "v1").unwrap();
+        delete_playlist(&a, &list).unwrap();
+        merge_payload(&mut b, &export_payload(&a, "dev-a")).unwrap();
+        assert!(!is_saved(&b, "v1"));
+        assert!(list_playlists(&b).is_empty());
+        assert!(list_playlist_items(&b, &list).is_empty());
+    }
+
+    #[test]
+    fn deleting_history_removes_its_watch_time() {
+        let conn = memory_db();
+        for (id, title, seconds) in [("v1", "One", 30), ("v2", "Two", 20)] {
+            record_watch(
+                &conn,
+                &WatchUpdate {
+                    video_id: id,
+                    title,
+                    channel_id: "UC1",
+                    channel_name: "Chan",
+                    duration: 100,
+                    position: seconds,
+                    seconds,
+                    new_view: true,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(stats_overview(&conn).total_seconds, 50);
+        assert_eq!(stats_overview(&conn).total_videos, 2);
+
+        delete_history_item(&conn, "v1").unwrap();
+        let overview = stats_overview(&conn);
+        assert_eq!(overview.total_seconds, 20);
+        assert_eq!(overview.total_videos, 1);
+    }
+
+    #[test]
+    fn only_changed_settings_travel_to_other_devices() {
+        let a = memory_db();
+        set_setting(&a, "sidebar_hover", "1").unwrap();
+        let payload = export_payload(&a, "dev-a");
+        assert!(payload
+            .settings
+            .iter()
+            .any(|s| s.key == "sidebar_hover" && s.value == "1"));
+
+        let mut b = memory_db();
+        merge_payload(&mut b, &payload).unwrap();
+        assert_eq!(get_setting(&b, "sidebar_hover").as_deref(), Some("1"));
+
+        // A newer local edit is not rolled back by an older snapshot.
+        set_setting(&b, "sidebar_hover", "0").unwrap();
+        merge_payload(&mut b, &payload).unwrap();
+        assert_eq!(get_setting(&b, "sidebar_hover").as_deref(), Some("0"));
     }
 }

@@ -493,7 +493,13 @@ impl Inner {
             ctx,
         });
         inner.set_option("vo", "libmpv");
-        inner.set_option("hwdec", "auto-safe");
+        if cfg!(target_os = "windows") {
+            // D3D11VA output into an OpenGL FBO occasionally hands back a black
+            // frame; CPU decode at 1080p is fast enough to avoid the flashes.
+            inner.set_option("hwdec", "no");
+        } else {
+            inner.set_option("hwdec", "auto-safe");
+        }
         inner.set_option("idle", "yes");
         inner.set_option("keep-open", "no");
         inner.set_option("terminal", "no");

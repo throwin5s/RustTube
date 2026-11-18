@@ -37,6 +37,9 @@ enum Route {
     Trending,
     Search(String, u32),
     Subscriptions,
+    Saved,
+    Playlists,
+    Playlist(String),
     Channel(String),
     Watch(String),
     History,
@@ -50,6 +53,8 @@ impl Route {
             Route::Trending => "trending",
             Route::Search(..) => "search",
             Route::Subscriptions => "subscriptions",
+            Route::Saved => "saved",
+            Route::Playlists | Route::Playlist(_) => "playlists",
             Route::Channel(_) => "channel",
             Route::Watch(_) => "watch",
             Route::History => "history",
@@ -64,6 +69,7 @@ impl Route {
         match self {
             Route::Search(query, page) => format!("search:{query}:{page}"),
             Route::Channel(id) => format!("channel:{id}"),
+            Route::Playlist(id) => format!("playlist:{id}"),
             Route::Watch(id) => format!("watch:{id}"),
             other => other.nav_key().to_string(),
         }
@@ -109,8 +115,8 @@ enum Msg {
     SubAvatar(String, Option<String>),
     Sync(Result<SyncReport, String>),
     UpdateCheck(Result<Option<Release>, String>),
-    UpdateInstalled(Result<(), String>),
-    UpdateDownloaded(Result<PathBuf, String>),
+    UpdateInstalled(Release, Result<(), String>),
+    UpdateDownloaded(Release, Result<PathBuf, String>),
 }
 
 #[derive(Clone, Default)]
@@ -188,7 +194,25 @@ enum UpdateState {
     Downloading,
     Ready,
     Downloaded(PathBuf),
-    Failed(String),
+    /// The install failed. `retry` keeps the release it was trying, so the
+    /// update button stays put and trying again is one click rather than a
+    /// fresh check first.
+    Failed { err: String, retry: Option<Release> },
+}
+
+impl UpdateState {
+    /// The release this state can install right now: one that is available, or
+    /// the one a failed install was trying.
+    fn installable(&self) -> Option<&Release> {
+        match self {
+            UpdateState::Available(release) => Some(release),
+            UpdateState::Failed {
+                retry: Some(release),
+                ..
+            } => Some(release),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -682,6 +706,13 @@ pub struct App {
     detail_id: String,
     history: Load<Vec<HistoryEntry>>,
     stats: Load<StatsOverview>,
+    saved: Load<Vec<db::SavedEntry>>,
+    playlists: Load<Vec<db::Playlist>>,
+    playlist_items: Load<Vec<db::PlaylistItem>>,
+    playlist_id: String,
+    new_playlist_name: String,
+    playlist_picker: bool,
+    delete_playlist_armed: Option<String>,
     subs: Vec<Subscription>,
 
     settings: SettingsDraft,
@@ -850,6 +881,13 @@ impl App {
             detail_id: String::new(),
             history: Load::Idle,
             stats: Load::Idle,
+            saved: Load::Idle,
+            playlists: Load::Idle,
+            playlist_items: Load::Idle,
+            playlist_id: String::new(),
+            new_playlist_name: String::new(),
+            playlist_picker: false,
+            delete_playlist_armed: None,
             subs: Vec::new(),
             settings: SettingsDraft::default(),
             sync_status: SyncStatus::default(),
@@ -1022,10 +1060,13 @@ impl App {
         });
     }
 
-    /// Install in place when the build owns its bundle, otherwise fetch the zip
-    /// and show the user where it landed.
+    /// Install in place when the build can replace itself (a macOS bundle or the
+    /// packaged Windows exe), otherwise fetch the zip and show the user where it
+    /// landed.
     fn install_update(&mut self) {
-        let UpdateState::Available(release) = self.update.clone() else {
+        // A failed install is installable too, so retrying it never needs a
+        // second click on "Check for updates".
+        let Some(release) = self.update.installable().cloned() else {
             return;
         };
         if update::can_self_install() {
@@ -1035,12 +1076,15 @@ impl App {
             // The download and bundle swap block, so keep them off the UI thread.
             std::thread::spawn(move || {
                 let result = update::install(&release);
-                let _ = tx.send(Msg::UpdateInstalled(result));
+                let _ = tx.send(Msg::UpdateInstalled(release, result));
                 ctx.request_repaint();
             });
         } else {
             self.update = UpdateState::Downloading;
-            self.spawn(async move { Msg::UpdateDownloaded(update::download(&release).await) });
+            self.spawn(async move {
+                let result = update::download(&release).await;
+                Msg::UpdateDownloaded(release, result)
+            });
         }
     }
 
@@ -1074,6 +1118,8 @@ impl App {
     fn navigate(&mut self, route: Route) {
         self.cancel_opening();
         self.closing = None;
+        self.playlist_picker = false;
+        self.delete_playlist_armed = None;
         if self.sidebar_hover && !self.sidebar_visible && self.sidebar_reveal > 0.01 {
             self.drawer_hold = true;
         }
@@ -1190,6 +1236,29 @@ impl App {
                 }
             }
             Route::Subscriptions if self.feed.is_idle() => self.load_feed(),
+            Route::Saved if self.saved.is_idle() => {
+                self.saved = loaded(Ok(self
+                    .with_db(|conn| db::list_saved(conn, 500))
+                    .unwrap_or_default()));
+            }
+            Route::Playlists if self.playlists.is_idle() => {
+                self.playlists = loaded(Ok(self
+                    .with_db(db::list_playlists)
+                    .unwrap_or_default()));
+            }
+            Route::Playlist(id) => {
+                if self.playlists.is_idle() {
+                    self.playlists = loaded(Ok(self
+                        .with_db(db::list_playlists)
+                        .unwrap_or_default()));
+                }
+                if self.playlist_items.is_idle() || self.playlist_id != id {
+                    self.playlist_id = id.clone();
+                    self.playlist_items = loaded(Ok(self
+                        .with_db(|conn| db::list_playlist_items(conn, &id))
+                        .unwrap_or_default()));
+                }
+            }
             Route::Channel(id) => {
                 if self.channel.is_idle() || self.channel_id != id {
                     self.channel_id = id.clone();
@@ -2110,6 +2179,10 @@ impl App {
                         self.history = Load::Idle;
                         self.stats = Load::Idle;
                         self.feed = Load::Idle;
+                        self.saved = Load::Idle;
+                        self.playlists = Load::Idle;
+                        self.playlist_items = Load::Idle;
+                        self.reload_synced_settings();
                         self.ensure_loaded();
                     }
                     Err(err) => self.toast(err),
@@ -2128,19 +2201,48 @@ impl App {
                     Err(_) => UpdateState::Idle,
                 };
             }
-            Msg::UpdateInstalled(result) => match result {
+            Msg::UpdateInstalled(release, result) => match result {
                 Ok(()) => {
                     self.update = UpdateState::Ready;
-                    // The bundle on disk is already the new build; re-exec into it.
-                    if let Err(err) = update::restart() {
-                        self.update = UpdateState::Failed(err);
+                    if cfg!(windows) {
+                        // The helper has already confirmed that it is running,
+                        // and is waiting for this process to release the exe and
+                        // DLLs before it replaces the folder and starts the new
+                        // build. Try to flush first, then go.
+                        self.flush_watch();
+                        self.player.quit();
+                        self.preview.quit();
+                        std::process::exit(0);
+                    } else {
+                        // The bundle on disk is already the new build; re-exec
+                        // into it.
+                        if let Err(err) = update::restart() {
+                            self.update = UpdateState::Failed {
+                                err,
+                                retry: Some(release),
+                            };
+                        }
                     }
                 }
-                Err(err) => self.update = UpdateState::Failed(err),
+                // The release is kept, so the button offers the same update
+                // again instead of making the user re-check for it.
+                Err(err) => {
+                    self.update = UpdateState::Failed {
+                        err,
+                        retry: Some(release),
+                    }
+                }
             },
-            Msg::UpdateDownloaded(result) => match result {
+            Msg::UpdateDownloaded(release, result) => match result {
                 Ok(path) => self.update = UpdateState::Downloaded(path),
-                Err(err) => self.update = UpdateState::Failed(err),
+                // Same as a failed install: the release stays, so a download
+                // that broke halfway can be tried again in one click.
+                Err(err) => {
+                    self.update = UpdateState::Failed {
+                        err,
+                        retry: Some(release),
+                    }
+                }
             },
         }
     }
@@ -2164,7 +2266,11 @@ impl App {
                     // The macOS traffic lights sit over the content when the
                     // titlebar is integrated; keep the navigation clear of them.
                     #[cfg(target_os = "macos")]
-                    ui.add_space(64.0);
+                    if self.sidebar_reveal < 0.01 && !self.sidebar_visible {
+                        // Only needed when the top bar starts at the window
+                        // edge; a docked sidebar already covers them.
+                        ui.add_space(64.0);
+                    }
 
                     let group_left = center - group_width / 2.0;
                     ui.add_space((group_left - ui.cursor().min.x).max(0.0));
@@ -2260,7 +2366,7 @@ impl App {
 
                 // Update notice beside the toggle: clear of the centred group
                 // and of the drag zone below it.
-                if let UpdateState::Available(release) = self.update.clone() {
+                if let Some(release) = self.update.installable().cloned() {
                     let pill = Rect::from_min_size(
                         egui::pos2(
                             ui.max_rect().right() - 136.0,
@@ -2286,7 +2392,7 @@ impl App {
                     if response.clicked() {
                         self.navigate(Route::Settings);
                     }
-                    response.on_hover_text(format!("RustTube {} is available", release.version));
+                    response.on_hover_text(format!("Update to RustTube {}", release.version));
                 }
 
                 // Keep the toggle out of the centered navigation: reveal it
@@ -2365,7 +2471,7 @@ impl App {
                 let group_right = center + group_width / 2.0;
                 let right_start = (group_right + 8.0).max(bar.left());
                 // Leave the update pill its own clickable space.
-                let pill_width = if matches!(self.update, UpdateState::Available(_)) {
+                let pill_width = if self.update.installable().is_some() {
                     144.0
                 } else {
                     60.0
@@ -2424,13 +2530,6 @@ impl App {
             } else {
                 target = 0.0;
             }
-        }
-        if !self.sidebar_hover {
-            self.sidebar_reveal = target;
-            self.sidebar_from = target;
-            self.sidebar_to = target;
-            self.sidebar_started = Instant::now();
-            return;
         }
         if target != self.sidebar_to {
             self.sidebar_from = self.sidebar_reveal;
@@ -2569,7 +2668,9 @@ impl App {
         }
         let poster = Rect::from_center_size(screen.center(), Vec2::new(width, height));
         ui.painter().rect_filled(screen, 0.0, Color32::BLACK);
-        ui.painter().rect_filled(poster, 0.0, Color32::BLACK);
+        // Same still underlay as the watch page, so a dropped frame is never a
+        // black rectangle.
+        self.paint_poster(ui, poster, &id);
         let snapshot = self.player.snapshot();
         if snapshot.started {
             self.player.paint(ui, poster);
@@ -2827,8 +2928,12 @@ impl App {
     }
 
     fn side_bar(&mut self, ctx: &egui::Context) {
+        let width = (t::SIDEBAR_WIDTH * self.sidebar_reveal).clamp(0.0, t::SIDEBAR_WIDTH);
+        if width < 0.5 {
+            return;
+        }
         egui::SidePanel::left("side")
-            .exact_width(t::SIDEBAR_WIDTH)
+            .exact_width(width)
             .resizable(false)
             .frame(
                 egui::Frame::NONE
@@ -2836,8 +2941,16 @@ impl App {
                     .inner_margin(Margin::symmetric(12, 12)),
             )
             .show(ctx, |ui| {
-                ui.set_width(t::SIDEBAR_WIDTH - 24.0);
-                self.side_content(ui);
+                // Keep the content at its full width and move it with the panel,
+                // so pinned mode slides like the hover drawer instead of wiping.
+                let shift = width - t::SIDEBAR_WIDTH;
+                let mut content = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(ui.max_rect().translate(egui::vec2(shift, 0.0)))
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                content.set_width(t::SIDEBAR_WIDTH - 24.0);
+                self.side_content(&mut content);
             });
     }
 
@@ -2852,11 +2965,16 @@ impl App {
         // `reveal` is already an ease-out curve; adding a second one made the
         // drawer jump most of the way open on its first frame and then crawl.
         let screen = ctx.screen_rect();
-        let top = t::TOP_BAR_HEIGHT;
+        // The sidebar reaches the top of the window now, so the drawer does too.
+        let top = 0.0;
         let x = screen.left() - t::SIDEBAR_WIDTH * (1.0 - reveal);
         egui::Area::new(egui::Id::new("sidebar-drawer"))
             .order(egui::Order::Foreground)
             .fixed_pos(egui::pos2(x, top))
+            // The drawer lives at a negative x while it slides in. Constraining
+            // it to the window clamped that back to 0 and made it appear at
+            // full width on the first frame.
+            .constrain(false)
             .interactable(true)
             .show(ctx, |ui| {
                 egui::Frame::NONE
@@ -2885,11 +3003,17 @@ impl App {
     /// Navigation plus the subscription list, shared by the docked sidebar and
     /// the hover drawer.
     fn side_content(&mut self, ui: &mut Ui) {
+                // The panel starts at the window's top edge; on macOS the traffic
+                // lights live in that corner, so leave room for them.
+                #[cfg(target_os = "macos")]
+                ui.add_space(26.0);
                 ui.add_space(8.0);
 
                 let active = self.route.nav_key();
                 let items = [
                     ("subscriptions", "Subscriptions", Route::Subscriptions),
+                    ("saved", "Saved", Route::Saved),
+                    ("playlists", "Playlists", Route::Playlists),
                     ("trending", "Trending", Route::Trending),
                     ("history", "History", Route::History),
                     ("stats", "Statistics", Route::Stats),
@@ -2937,21 +3061,28 @@ impl App {
                             } else {
                                 sub.channel_name.clone()
                             };
-                            ui.horizontal(|ui| {
+                            let row = ui
+                                .horizontal(|ui| {
                                 ui.add_space(SUB_ROW_INDENT as f32);
                                 self.paint_avatar(ui, &label, &sub.channel_avatar, 22.0);
-                                let row = ui
-                                    .add(
-                                        egui::Label::new(
-                                            RichText::new(&label).size(13.0).color(t::DIM),
-                                        )
-                                        .sense(egui::Sense::click()),
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&label).size(13.0).color(t::DIM),
                                     )
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                if row.clicked() {
-                                    self.navigate(Route::Channel(sub.channel_id.clone()));
-                                }
-                            });
+                                    .truncate(),
+                                );
+                            })
+                            .response;
+                            // The whole row, avatar included, opens the channel.
+                            // Before this only the text label was clickable, so
+                            // clicking the round icon did nothing.
+                            if row
+                                .interact(egui::Sense::click())
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                self.navigate(Route::Channel(sub.channel_id.clone()));
+                            }
                             ui.add_space(4.0);
                         }
                     });
@@ -3355,18 +3486,7 @@ impl App {
     ) -> Option<Rect> {
         // No transport controls over a picture that is not on screen yet; the
         // poster and its "Starting…" badge own that state.
-        if !snapshot.started {
-            return None;
-        }
-        let pointer_over = ui
-            .ctx()
-            .pointer_hover_pos()
-            .is_some_and(|pos| poster.contains(pos));
-        let menu_open = self.playback_menu_open || ui.ctx().is_popup_open();
-        if !snapshot.paused && !pointer_over && !menu_open {
-            return None;
-        }
-        if poster.width() < 240.0 || poster.height() < 130.0 {
+        if !snapshot.started || poster.width() < 240.0 || poster.height() < 130.0 {
             return None;
         }
 
@@ -3375,10 +3495,28 @@ impl App {
             egui::pos2(poster.left() + inset, poster.bottom() - 100.0),
             egui::pos2(poster.right() - inset, poster.bottom() - inset),
         );
+        let pointer = ui.ctx().pointer_hover_pos();
+        let pointer_over = pointer.is_some_and(|pos| poster.contains(pos));
+        let over_hud = pointer.is_some_and(|pos| rect.contains(pos));
+        let menu_open = self.playback_menu_open || ui.ctx().is_popup_open();
+        // Show on movement over the picture, while paused, or while using the
+        // menu. Resting lets them fade; resting on the controls keeps them up.
+        let show = snapshot.paused
+            || menu_open
+            || (pointer_over
+                && (self.last_pointer_move.elapsed() < Duration::from_millis(2200) || over_hud));
+        let alpha = ui.ctx().animate_bool_with_time(
+            egui::Id::new("video-hud-alpha"),
+            show,
+            0.18,
+        );
+        if alpha <= 0.004 {
+            return None;
+        }
         ui.painter().rect_filled(
             rect,
             CornerRadius::same(12),
-            Color32::from_black_alpha(210),
+            Color32::from_black_alpha((210.0 * alpha) as u8),
         );
 
         let mut hud = ui.new_child(
@@ -3387,6 +3525,7 @@ impl App {
                 .max_rect(rect.shrink2(Vec2::new(12.0, 7.0)))
                 .layout(Layout::top_down(Align::Min)),
         );
+        hud.set_opacity(alpha);
         hud.spacing_mut().item_spacing = Vec2::new(6.0, 2.0);
 
         let duration = if snapshot.duration > 0.0 {
@@ -3710,11 +3849,10 @@ impl App {
                             );
                         }
                     } else if video_ready {
-                        ui.painter().rect_filled(
-                            poster,
-                            CornerRadius::same(t::RADIUS),
-                            Color32::BLACK,
-                        );
+                        // Underlay the video with the still: if the GL callback
+                        // is skipped for a frame (or WGL delays it), the poster
+                        // shows instead of a black flash.
+                        self.paint_poster(ui, poster, &id);
                         self.player.paint(ui, poster);
                         // A play affordance appears only while paused, so
                         // hovering a playing video never changes its picture.
@@ -3849,6 +3987,38 @@ impl App {
                             self.navigate(Route::Channel(card.channel_id.clone()));
                         }
                     });
+
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let saved = self
+                            .with_db(|conn| db::is_saved(conn, &card.id))
+                            .unwrap_or(false);
+                        if t::quiet_button(ui, if saved { "Saved" } else { "Save" }).clicked() {
+                            let _ = self.with_db(|conn| {
+                                db::set_saved(
+                                    conn,
+                                    &card.id,
+                                    &card.title,
+                                    &card.channel_id,
+                                    &card.channel_name,
+                                    card.duration,
+                                    !saved,
+                                )
+                            });
+                            self.saved = Load::Idle;
+                            self.toast(if saved {
+                                "Removed from Saved"
+                            } else {
+                                "Saved"
+                            });
+                        }
+                        if t::quiet_button(ui, "Add to playlist").clicked() {
+                            self.playlist_picker = !self.playlist_picker;
+                        }
+                    });
+                    if self.playlist_picker {
+                        self.playlist_picker_panel(ui, &card);
+                    }
 
                     ui.add_space(10.0);
                     if external {
@@ -4171,9 +4341,432 @@ impl App {
                 if let Some(id) = remove {
                     let _ = self.with_db(|conn| db::delete_history_item(conn, &id));
                     self.history = Load::Idle;
+                    // The delete also took this video's watch time out of the
+                    // per-device totals, so the next visit must re-read them.
+                    self.stats = Load::Idle;
                     self.ensure_loaded();
                 }
             }
+        }
+    }
+
+    /// Re-read the preferences that sync across devices after a merge, so a
+    /// change made on another machine takes effect without a restart.
+    fn reload_synced_settings(&mut self) {
+        let Some((hover, wide, previews, zoom, anim, visible)) = self.with_db(|conn| {
+            (
+                db::get_setting(conn, "sidebar_hover")
+                    .map(|v| v == "1")
+                    .unwrap_or(false),
+                db::get_setting(conn, "wide_player")
+                    .map(|v| v == "1")
+                    .unwrap_or(false),
+                db::get_setting(conn, "previews")
+                    .map(|v| v != "0")
+                    .unwrap_or(true),
+                db::get_setting(conn, "watch_zoom")
+                    .map(|v| v == "1")
+                    .unwrap_or(false),
+                db::get_setting(conn, "anim_speed")
+                    .unwrap_or_else(|| "normal".to_string()),
+                db::get_setting(conn, "sidebar_visible")
+                    .map(|v| v == "1")
+                    .unwrap_or(true),
+            )
+        }) else {
+            return;
+        };
+        self.sidebar_hover = hover;
+        self.wide_player = wide;
+        self.preview_enabled = previews;
+        self.watch_zoom = zoom;
+        self.anim_speed = anim;
+        if self.sidebar_visible != visible {
+            self.sidebar_visible = visible;
+            self.sidebar_to = if visible { 1.0 } else { 0.0 };
+            self.sidebar_from = self.sidebar_reveal;
+            self.sidebar_started = Instant::now();
+        }
+        if !self.sidebar_hover {
+            self.sidebar_reveal = if self.sidebar_visible { 1.0 } else { 0.0 };
+            self.sidebar_from = self.sidebar_reveal;
+            self.sidebar_to = self.sidebar_reveal;
+        }
+    }
+
+    /// Inline picker under the watch page's actions: tick an existing playlist
+    /// or create a new one and put the current video in it.
+    fn playlist_picker_panel(&mut self, ui: &mut Ui, card: &VideoCard) {
+        let playlists = self.with_db(db::list_playlists).unwrap_or_default();
+        let mut changed = false;
+        ui.add_space(4.0);
+        t::panel_frame().show(ui, |ui| {
+            ui.label(RichText::new("Save to playlist").size(12.5).strong());
+            ui.add_space(4.0);
+            if playlists.is_empty() {
+                ui.label(
+                    RichText::new("No playlists yet — create one below.")
+                        .size(11.5)
+                        .color(t::DIM_2),
+                );
+            }
+            for playlist in &playlists {
+                let inside = self
+                    .with_db(|conn| db::is_in_playlist(conn, &playlist.playlist_id, &card.id))
+                    .unwrap_or(false);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&playlist.name).size(12.5).color(t::DIM));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if t::quiet_button(ui, if inside { "Remove" } else { "Add" }).clicked() {
+                            let _ = self.with_db(|conn| {
+                                if inside {
+                                    db::remove_from_playlist(
+                                        conn,
+                                        &playlist.playlist_id,
+                                        &card.id,
+                                    )
+                                } else {
+                                    db::add_to_playlist(
+                                        conn,
+                                        &playlist.playlist_id,
+                                        &card.id,
+                                        &card.title,
+                                        &card.channel_id,
+                                        &card.channel_name,
+                                        card.duration,
+                                    )
+                                }
+                            });
+                            changed = true;
+                        }
+                    });
+                });
+            }
+            ui.add_space(6.0);
+            let mut create = false;
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.new_playlist_name)
+                        .hint_text("New playlist name")
+                        .desired_width(180.0)
+                        .margin(Vec2::new(8.0, 6.0)),
+                );
+                if t::quiet_button(ui, "Create & add").clicked() {
+                    create = true;
+                }
+            });
+            if create {
+                let name = self.new_playlist_name.trim().to_string();
+                if !name.is_empty() {
+                    if let Some(id) = self
+                        .with_db(|conn| db::create_playlist(conn, &name).ok())
+                        .flatten()
+                    {
+                        let _ = self.with_db(|conn| {
+                            db::add_to_playlist(
+                                conn,
+                                &id,
+                                &card.id,
+                                &card.title,
+                                &card.channel_id,
+                                &card.channel_name,
+                                card.duration,
+                            )
+                        });
+                        self.new_playlist_name.clear();
+                        changed = true;
+                    }
+                }
+            }
+        });
+        if changed {
+            self.playlists = Load::Idle;
+            self.playlist_items = Load::Idle;
+        }
+    }
+
+    /// One compact thumbnail row shared by Saved and the playlist pages.
+    /// Returns (open the video, the row's action button was pressed, rect).
+    fn media_row(
+        &mut self,
+        ui: &mut Ui,
+        video_id: &str,
+        title: &str,
+        channel: &str,
+        action_label: &str,
+    ) -> (bool, bool, Rect) {
+        let width = ui.available_width();
+        let mut open = false;
+        let mut action = false;
+        let mut thumb_rect = Rect::NOTHING;
+        let response = ui
+            .allocate_ui_with_layout(
+                Vec2::new(width, 66.0),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    let (thumb, _) =
+                        ui.allocate_exact_size(Vec2::new(118.0, 66.0), Sense::hover());
+                    thumb_rect = thumb;
+                    self.paint_thumb(ui, thumb, video_id, "mq");
+                    ui.add_space(10.0);
+                    ui.vertical(|ui| {
+                        ui.set_width((width - 210.0).max(120.0));
+                        let title = if title.is_empty() { "Untitled" } else { title };
+                        open |= ui
+                            .add(
+                                egui::Label::new(RichText::new(title).size(13.5))
+                                    .truncate()
+                                    .sense(Sense::click()),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .clicked();
+                        ui.label(
+                            RichText::new(if channel.is_empty() {
+                                "Unknown channel"
+                            } else {
+                                channel
+                            })
+                            .size(11.5)
+                            .color(t::DIM_2),
+                        );
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if t::quiet_button(ui, action_label).clicked() {
+                            action = true;
+                        }
+                    });
+                },
+            )
+            .response;
+        // The thumbnail and blank space open the video too; the action button
+        // keeps its own click even though the row underneath is clickable.
+        if !action && response.interact(Sense::click()).clicked() {
+            open = true;
+        }
+        (open, action, thumb_rect)
+    }
+
+    fn view_saved(&mut self, ui: &mut Ui) {
+        t::h1(ui, "Saved");
+        t::sub(ui, "Watch later · syncs across devices");
+        ui.add_space(14.0);
+        match &self.saved {
+            Load::Idle | Load::Loading => {
+                ui.spinner();
+            }
+            Load::Failed(err) => {
+                ui.label(RichText::new(err).size(12.5).color(t::DIM));
+            }
+            Load::Ready(items) => {
+                let items = items.clone();
+                if items.is_empty() {
+                    self.empty_block(
+                        ui,
+                        "Nothing saved yet",
+                        "Open a video and press Save. Saved videos sync across devices.",
+                    );
+                    return;
+                }
+                let mut open: Option<(String, Rect)> = None;
+                let mut remove: Option<String> = None;
+                for item in &items {
+                    let (clicked, action, rect) = self.media_row(
+                        ui,
+                        &item.video_id,
+                        &item.title,
+                        &item.channel_name,
+                        "Remove",
+                    );
+                    if clicked {
+                        open = Some((item.video_id.clone(), rect));
+                    }
+                    if action {
+                        remove = Some(item.video_id.clone());
+                    }
+                    ui.separator();
+                }
+                if let Some(id) = remove {
+                    let _ = self.with_db(|conn| {
+                        db::set_saved(conn, &id, "", "", "", 0, false)
+                    });
+                    self.saved = Load::Idle;
+                    self.ensure_loaded();
+                } else if let Some((id, rect)) = open {
+                    self.begin_open(id, rect);
+                }
+            }
+        }
+    }
+
+    fn view_playlists(&mut self, ui: &mut Ui) {
+        t::h1(ui, "Playlists");
+        t::sub(ui, "Line up videos to watch together · syncs across devices");
+        ui.add_space(12.0);
+
+        let mut create = false;
+        ui.horizontal(|ui| {
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut self.new_playlist_name)
+                    .hint_text("New playlist name")
+                    .desired_width(240.0)
+                    .margin(Vec2::new(10.0, 8.0)),
+            );
+            create |= field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if t::accent_button(ui, "Create playlist").clicked() {
+                create = true;
+            }
+        });
+        if create {
+            let name = self.new_playlist_name.trim().to_string();
+            if !name.is_empty() {
+                if let Some(id) = self
+                    .with_db(|conn| db::create_playlist(conn, &name).ok())
+                    .flatten()
+                {
+                    self.new_playlist_name.clear();
+                    self.playlists = Load::Idle;
+                    self.navigate(Route::Playlist(id));
+                    return;
+                }
+            }
+        }
+
+        ui.add_space(16.0);
+        let playlists = match &self.playlists {
+            Load::Idle | Load::Loading => {
+                ui.spinner();
+                return;
+            }
+            Load::Failed(err) => {
+                ui.label(RichText::new(err).size(12.5).color(t::DIM));
+                return;
+            }
+            Load::Ready(list) => list.clone(),
+        };
+        if playlists.is_empty() {
+            self.empty_block(
+                ui,
+                "No playlists yet",
+                "Create one above, then add videos from any watch page.",
+            );
+            return;
+        }
+
+        let mut open: Option<String> = None;
+        let mut delete: Option<String> = None;
+        for playlist in &playlists {
+            let armed =
+                self.delete_playlist_armed.as_deref() == Some(playlist.playlist_id.as_str());
+            let row = ui
+                .horizontal(|ui| {
+                    let name = ui
+                        .add(
+                            egui::Label::new(RichText::new(&playlist.name).size(14.0))
+                                .truncate()
+                                .sense(Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    ui.label(
+                        RichText::new(format!(
+                            "{} video{}",
+                            playlist.item_count,
+                            if playlist.item_count == 1 { "" } else { "s" }
+                        ))
+                        .size(11.5)
+                        .color(t::DIM_2),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let label = if armed { "Click again to delete" } else { "Delete" };
+                        if t::danger_button(ui, label).clicked() {
+                            delete = Some(playlist.playlist_id.clone());
+                        }
+                    });
+                    name.clicked()
+                })
+                .inner;
+            if row && delete.is_none() {
+                open = Some(playlist.playlist_id.clone());
+            }
+            ui.separator();
+        }
+        if let Some(id) = delete {
+            if self.delete_playlist_armed.as_deref() == Some(id.as_str()) {
+                let _ = self.with_db(|conn| db::delete_playlist(conn, &id));
+                self.delete_playlist_armed = None;
+                self.playlists = Load::Idle;
+                self.playlist_items = Load::Idle;
+                self.ensure_loaded();
+            } else {
+                self.delete_playlist_armed = Some(id);
+            }
+        } else if let Some(id) = open {
+            self.navigate(Route::Playlist(id));
+        }
+    }
+
+    fn view_playlist(&mut self, ui: &mut Ui, id: String) {
+        let name = self
+            .playlists
+            .ready()
+            .and_then(|list| list.iter().find(|p| p.playlist_id == id))
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "Playlist".to_string());
+        ui.horizontal(|ui| {
+            if t::quiet_button(ui, "Back").clicked() {
+                self.back();
+            }
+            ui.vertical(|ui| {
+                t::h1(ui, &name);
+                t::sub(ui, "Videos in this playlist, oldest first");
+            });
+        });
+        ui.add_space(14.0);
+
+        let items = match &self.playlist_items {
+            Load::Idle | Load::Loading => {
+                ui.spinner();
+                return;
+            }
+            Load::Failed(err) => {
+                ui.label(RichText::new(err).size(12.5).color(t::DIM));
+                return;
+            }
+            Load::Ready(items) => items.clone(),
+        };
+        if items.is_empty() {
+            self.empty_block(
+                ui,
+                "Nothing here yet",
+                "Open any video and use Add to playlist.",
+            );
+            return;
+        }
+
+        let mut open: Option<(String, Rect)> = None;
+        let mut remove: Option<String> = None;
+        for item in &items {
+            let (clicked, action, rect) = self.media_row(
+                ui,
+                &item.video_id,
+                &item.title,
+                &item.channel_name,
+                "Remove",
+            );
+            if clicked {
+                open = Some((item.video_id.clone(), rect));
+            }
+            if action {
+                remove = Some(item.video_id.clone());
+            }
+            ui.separator();
+        }
+        if let Some(video_id) = remove {
+            let _ = self.with_db(|conn| db::remove_from_playlist(conn, &id, &video_id));
+            self.playlist_items = Load::Idle;
+            self.playlists = Load::Idle;
+            self.ensure_loaded();
+        } else if let Some((video_id, rect)) = open {
+            self.begin_open(video_id, rect);
         }
     }
 
@@ -4633,7 +5226,7 @@ impl App {
                     ui.label(RichText::new("Cross-device sync").size(14.5).strong());
                     ui.label(
                         RichText::new(
-                            "Subscriptions, history and watch time are written as one JSON snapshot into storage you control. No account, no server in the middle.",
+                            "Subscriptions, history, watch time, saved videos, playlists and settings are written as one JSON snapshot into storage you control. No account, no server in the middle.",
                         )
                         .size(11.8)
                         .color(t::DIM_2),
@@ -4875,7 +5468,7 @@ impl App {
                             format!("Saved to {}", path.display()),
                             t::DIM,
                         ),
-                        UpdateState::Failed(err) => (err.clone(), t::DANGER),
+                        UpdateState::Failed { err, .. } => (err.clone(), t::DANGER),
                     };
                     ui.label(RichText::new(status).size(11.5).color(color));
                     ui.add_space(6.0);
@@ -4895,7 +5488,7 @@ impl App {
                         if check.clicked() && !busy {
                             self.check_updates();
                         }
-                        if matches!(self.update, UpdateState::Available(_)) {
+                        if self.update.installable().is_some() {
                             let label = if update::can_self_install() {
                                 "Update & restart"
                             } else {
@@ -4914,7 +5507,7 @@ impl App {
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new(
-                            "Sync copies only subscriptions, history and watch time — never settings or credentials.",
+                            "Sync copies subscriptions, history, watch time, saved videos, playlists and UI/playback settings. Credentials and device-only state such as volume stay here.",
                         )
                         .size(11.0)
                         .color(t::DIM_2),
@@ -5421,11 +6014,18 @@ impl eframe::App for App {
         self.animate_sidebar(ctx);
         let immersive = self.fullscreen && self.can_go_fullscreen();
         if !immersive {
-            self.top_bar(ctx);
             if self.sidebar_hover && !self.sidebar_visible {
+                // The drawer floats over everything, including the top bar.
+                self.top_bar(ctx);
                 self.hover_drawer(ctx);
-            } else if self.sidebar_visible {
-                self.side_bar(ctx);
+            } else {
+                if self.sidebar_visible || (!self.sidebar_hover && self.sidebar_reveal > 0.001)
+                {
+                    // Added before the top bar so the panel spans the whole
+                    // window height and the bar fills the width beside it.
+                    self.side_bar(ctx);
+                }
+                self.top_bar(ctx);
             }
             self.sidebar_grip(ctx);
         }
@@ -5489,6 +6089,9 @@ impl eframe::App for App {
                             Route::Trending => self.view_trending(ui),
                             Route::Search(query, page) => self.view_search(ui, query, page),
                             Route::Subscriptions => self.view_subscriptions(ui),
+                            Route::Saved => self.view_saved(ui),
+                            Route::Playlists => self.view_playlists(ui),
+                            Route::Playlist(id) => self.view_playlist(ui, id),
                             Route::Channel(id) => self.view_channel(ui, id),
                             Route::Watch(id) => self.view_watch(ui, id),
                             Route::History => self.view_history(ui),

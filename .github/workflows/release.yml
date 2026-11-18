@@ -157,6 +157,12 @@ jobs:
       - name: Build
         run: cargo build --release --target x86_64-pc-windows-gnu
 
+      - name: Test the in-place updater
+        run: |
+          $dllDir = Split-Path $env:LIBMPV_DLL -Parent
+          $env:PATH = "$dllDir;$env:PATH"
+          cargo test --release --target x86_64-pc-windows-gnu update::tests -- --nocapture
+
       - name: Package
         run: |
           $ErrorActionPreference = "Stop"

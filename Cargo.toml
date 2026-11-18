@@ -1,6 +1,6 @@
 [package]
 name = "rusttube"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 rust-version = "1.85"
 description = "A native YouTube client with cross-device cloud sync"
@@ -15,7 +15,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli", "deflate"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli", "deflate", "blocking"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
