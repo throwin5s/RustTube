@@ -141,6 +141,94 @@ pub async fn check() -> Result<Option<Release>, String> {
     }))
 }
 
+// -------------------------------------------------------------------- failures
+
+/// The reasons an update can stop, in the words the Settings card shows.
+///
+/// The errors underneath carry URLs, crate names and type names, none of which
+/// help someone decide what to do next, so every failure is reported through
+/// here instead of being printed as it arrived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Failure {
+    /// GitHub could not be reached: offline, DNS, proxy or firewall.
+    Offline,
+    /// GitHub answered but would not serve the update: rate limit, server error,
+    /// or no asset for this platform yet.
+    Refused,
+    /// RustTube's own folder cannot be written by this user.
+    ReadOnlyInstall,
+    /// The Windows helper never confirmed it had started.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    NoHelper,
+    /// The download could not be unpacked or put in place.
+    Swap,
+    /// The new build is installed but the app could not reopen itself.
+    Restart,
+}
+
+impl Failure {
+    /// One plain sentence: what happened, and the next thing to try.
+    pub fn message(self) -> &'static str {
+        match self {
+            Failure::Offline => {
+                "Couldn't reach GitHub to download the update. Check your internet connection, then try again."
+            }
+            Failure::Refused => {
+                "GitHub didn't send the update just now. Wait a minute, then try again."
+            }
+            Failure::ReadOnlyInstall => {
+                "RustTube can't write to its own folder, so the update wasn't installed. Move RustTube to a folder you can write to, then try again."
+            }
+            Failure::NoHelper => {
+                "The update helper didn't start, so RustTube kept running and nothing was changed. Try again."
+            }
+            Failure::Swap => {
+                "The update couldn't be installed, so RustTube is still on the version you had. Try again."
+            }
+            Failure::Restart => {
+                "RustTube is updated, but it couldn't reopen itself. Quit RustTube and open it again."
+            }
+        }
+    }
+}
+
+/// Which plain failure a `self_update` error really is.
+impl From<&self_update::errors::Error> for Failure {
+    fn from(err: &self_update::errors::Error) -> Self {
+        use self_update::errors::Error as E;
+        match err {
+            E::Transport(_) | E::InvalidProxy { .. } | E::InvalidCertificate { .. } => {
+                Failure::Offline
+            }
+            E::RateLimited { .. }
+            | E::HttpStatus { .. }
+            | E::NotFound { .. }
+            | E::Unauthorized { .. } => Failure::Refused,
+            E::InstallPathNotWritable { .. } | E::AppTranslocated { .. } => {
+                Failure::ReadOnlyInstall
+            }
+            _ => Failure::Swap,
+        }
+    }
+}
+
+/// The sentence to show for a `self_update` error.
+fn describe(err: &self_update::errors::Error) -> String {
+    match err {
+        // Naming the folder is what makes the advice concrete.
+        self_update::errors::Error::InstallPathNotWritable { path, .. } => read_only(path),
+        other => Failure::from(other).message().to_string(),
+    }
+}
+
+/// "can't write to `<path>`", with the folder named so the fix is obvious.
+fn read_only(path: &Path) -> String {
+    format!(
+        "RustTube can't write to {}, so the update wasn't installed. Move RustTube to a folder you can write to, then try again.",
+        path.display()
+    )
+}
+
 // --------------------------------------------------------------------- install
 
 /// True when this build can replace itself: a macOS `.app` bundle, or the
@@ -226,9 +314,9 @@ fn install_into(release: &Release, bundle: Option<&Path>) -> Result<(), String> 
     }
     builder
         .build()
-        .map_err(|err| format!("Could not prepare the update: {err}"))?
+        .map_err(|err| describe(&err))?
         .update()
-        .map_err(|err| format!("Update failed: {err}"))?;
+        .map_err(|err| describe(&err))?;
     Ok(())
 }
 
@@ -292,26 +380,20 @@ fn install_windows(release: &Release) -> Result<(), String> {
     // Fail while the app is still open if the install folder cannot be written;
     // otherwise the helper would exit and leave the user with no window at all.
     let probe = install.join(".rusttube-update-probe");
-    std::fs::write(&probe, b"ok").map_err(|err| {
-        format!(
-            "Cannot write to {}. Move RustTube somewhere you can write, then update again ({err}).",
-            install.display()
-        )
-    })?;
+    std::fs::write(&probe, b"ok").map_err(|_| read_only(&install))?;
     let _ = std::fs::remove_file(&probe);
 
     let work = std::env::temp_dir().join(format!("RustTube-update-{}", release.version));
     // A previous attempt may have left an archive or a half-unpacked folder.
     let _ = std::fs::remove_dir_all(&work);
-    std::fs::create_dir_all(&work)
-        .map_err(|err| format!("Could not create {}: {err}", work.display()))?;
+    std::fs::create_dir_all(&work).map_err(|_| Failure::Swap.message().to_string())?;
 
     let archive = work.join(&name);
     download_blocking(&url, &archive)?;
 
     let unpacked = work.join("unpacked");
     std::fs::create_dir_all(&unpacked)
-        .map_err(|err| format!("Could not create {}: {err}", unpacked.display()))?;
+        .map_err(|_| Failure::Swap.message().to_string())?;
     // tar.exe ships with Windows 10+, and reads the zip GitHub produces.
     let status = std::process::Command::new("tar")
         .arg("-xf")
@@ -319,14 +401,12 @@ fn install_windows(release: &Release) -> Result<(), String> {
         .arg("-C")
         .arg(&unpacked)
         .status()
-        .map_err(|err| format!("Could not unpack the update: {err}"))?;
+        .map_err(|_| Failure::Swap.message().to_string())?;
     if !status.success() {
-        return Err("Could not unpack the update archive.".into());
+        return Err(Failure::Swap.message().to_string());
     }
 
-    let staged = staged_root(&unpacked).ok_or_else(|| {
-        "The update archive does not contain RustTube.exe.".to_string()
-    })?;
+    let staged = staged_root(&unpacked).ok_or_else(|| Failure::Swap.message().to_string())?;
     let ready = work.join("helper-ready");
     let backup = work.join("previous");
     let plan = SwapPlan::new(&staged, &install, &backup, &ready, std::process::id());
@@ -349,7 +429,7 @@ fn install_windows(release: &Release) -> Result<(), String> {
     command.creation_flags(0x0800_0000);
     let mut child = command
         .spawn()
-        .map_err(|err| format!("Could not start the update helper: {err}"))?;
+        .map_err(|_| Failure::NoHelper.message().to_string())?;
 
     // Wait for the helper to say it is running before reporting success, because
     // success is what makes the app quit. A helper that dies on start-up, or
@@ -366,10 +446,7 @@ fn install_windows(release: &Release) -> Result<(), String> {
         // A half-started helper must not be able to swap files later, so the
         // files it would copy are removed with it.
         let _ = std::fs::remove_dir_all(&work);
-        return Err(
-            "The update helper did not start, so RustTube kept running. Try updating again."
-                .to_string(),
-        );
+        return Err(Failure::NoHelper.message().to_string());
     }
     Ok(())
 }
@@ -378,23 +455,19 @@ fn install_windows(release: &Release) -> Result<(), String> {
 /// thread while the UI shows "Installing".
 #[cfg(windows)]
 fn download_blocking(url: &str, path: &Path) -> Result<(), String> {
+    let offline = || Failure::Offline.message().to_string();
     let client = reqwest::blocking::Client::builder()
         .user_agent(format!("RustTube/{}", current_version()))
         .timeout(std::time::Duration::from_secs(600))
         .build()
-        .map_err(|err| err.to_string())?;
-    let mut response = client.get(url).send().map_err(|err| err.to_string())?;
+        .map_err(|_| offline())?;
+    let mut response = client.get(url).send().map_err(|_| offline())?;
     if !response.status().is_success() {
-        return Err(format!(
-            "Download failed: GitHub returned {}",
-            response.status()
-        ));
+        return Err(Failure::Refused.message().to_string());
     }
     let mut file = std::fs::File::create(path)
-        .map_err(|err| format!("Could not write {}: {err}", path.display()))?;
-    response
-        .copy_to(&mut file)
-        .map_err(|err| format!("Could not save {}: {err}", path.display()))?;
+        .map_err(|_| Failure::Swap.message().to_string())?;
+    response.copy_to(&mut file).map_err(|_| offline())?;
     Ok(())
 }
 
@@ -582,31 +655,25 @@ pub async fn download(release: &Release) -> Result<PathBuf, String> {
         .unwrap_or_else(|| asset_name(&release.version));
 
     let dir = downloads_dir();
-    std::fs::create_dir_all(&dir)
-        .map_err(|err| format!("Could not create {}: {err}", dir.display()))?;
+    std::fs::create_dir_all(&dir).map_err(|_| Failure::Swap.message().to_string())?;
     let archive = dir.join(&name);
 
+    let offline = || Failure::Offline.message().to_string();
     let client = reqwest::Client::builder()
         .user_agent(format!("RustTube/{}", current_version()))
         .timeout(std::time::Duration::from_secs(300))
         .build()
-        .map_err(|err| err.to_string())?;
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|_| offline())?;
+    let response = client.get(&url).send().await.map_err(|_| offline())?;
     if !response.status().is_success() {
-        return Err(format!("Download failed: GitHub returned {}", response.status()));
+        return Err(Failure::Refused.message().to_string());
     }
-    let bytes = response.bytes().await.map_err(|err| err.to_string())?;
-    std::fs::write(&archive, &bytes)
-        .map_err(|err| format!("Could not write {}: {err}", archive.display()))?;
+    let bytes = response.bytes().await.map_err(|_| offline())?;
+    std::fs::write(&archive, &bytes).map_err(|_| Failure::Swap.message().to_string())?;
 
     let target = dir.join(format!("RustTube-{}", release.version));
     let _ = std::fs::remove_dir_all(&target);
-    std::fs::create_dir_all(&target)
-        .map_err(|err| format!("Could not create {}: {err}", target.display()))?;
+    std::fs::create_dir_all(&target).map_err(|_| Failure::Swap.message().to_string())?;
     // bsdtar ships with macOS and with Windows 10+, and reads zip archives, so
     // this avoids pulling a decompressor into the build just for updates.
     let status = std::process::Command::new("tar")
@@ -615,9 +682,9 @@ pub async fn download(release: &Release) -> Result<PathBuf, String> {
         .arg("-C")
         .arg(&target)
         .status()
-        .map_err(|err| format!("Could not unpack the update: {err}"))?;
+        .map_err(|_| Failure::Swap.message().to_string())?;
     if !status.success() {
-        return Err("Could not unpack the update archive.".into());
+        return Err(Failure::Swap.message().to_string());
     }
 
     reveal(&target);
@@ -629,7 +696,8 @@ pub fn restart() -> Result<(), String> {
     // binary is spawned and this one exits (windows).
     match self_update::restart::restart() {
         Ok(never) => match never {},
-        Err(err) => Err(format!("Could not restart RustTube: {err}")),
+        // The new build is already installed, so "try again" would be wrong here.
+        Err(_) => Err(Failure::Restart.message().to_string()),
     }
 }
 
@@ -865,6 +933,87 @@ mod tests {
             std::time::Duration::from_millis(150),
             || true
         ));
+    }
+
+    /// The card is read by someone who wants to know what to do next, so no
+    /// message may carry a URL, a crate name or an error type name.
+    #[test]
+    fn update_failures_read_as_plain_advice() {
+        for failure in [
+            Failure::Offline,
+            Failure::Refused,
+            Failure::ReadOnlyInstall,
+            Failure::NoHelper,
+            Failure::Swap,
+            Failure::Restart,
+        ] {
+            let message = failure.message();
+            assert!(!message.is_empty(), "{failure:?} needs a message");
+            assert!(
+                message.ends_with('.'),
+                "{failure:?} should read as a sentence: {message}"
+            );
+            let lower = message.to_lowercase();
+            for raw in [
+                "http",
+                "www.",
+                "::",
+                "error",
+                "self_update",
+                "reqwest",
+                "transport",
+                "installpath",
+                "{",
+                "}",
+            ] {
+                assert!(
+                    !lower.contains(raw),
+                    "{failure:?} leaks developer detail {raw:?}: {message}"
+                );
+            }
+            assert!(
+                lower.contains("try again") || lower.contains("open it again"),
+                "{failure:?} should say what to do next: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_update_failure_has_its_own_message() {
+        let mut seen = std::collections::HashSet::new();
+        for failure in [
+            Failure::Offline,
+            Failure::Refused,
+            Failure::ReadOnlyInstall,
+            Failure::NoHelper,
+            Failure::Swap,
+            Failure::Restart,
+        ] {
+            assert!(
+                seen.insert(failure.message()),
+                "duplicate message for {failure:?}"
+            );
+        }
+    }
+
+    /// A dropped connection surfaces as `Transport`, which used to be printed as
+    /// `TransportError: error sending request for url (https://...)`.
+    #[test]
+    fn a_failed_request_is_reported_as_unreachable() {
+        let err = self_update::errors::Error::Transport(Box::new(std::io::Error::other(
+            "error sending request for url (https://api.github.com/repos/x/y/releases)",
+        )));
+        let message = describe(&err);
+        assert_eq!(message, Failure::Offline.message());
+        assert!(!message.contains("api.github.com"));
+    }
+
+    #[test]
+    fn a_read_only_install_names_the_folder() {
+        let message = read_only(Path::new("/Applications/RustTube.app"));
+        assert!(message.contains("/Applications/RustTube.app"));
+        assert!(message.contains("Move RustTube"));
+        assert!(message.ends_with('.'));
     }
 
     #[test]
