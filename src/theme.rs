@@ -344,7 +344,7 @@ pub fn player_primary_button(ui: &mut Ui, icon: Icon, size: f32) -> Response {
     };
     ui.painter()
         .circle_filled(rect.center(), size * 0.5, fill);
-    paint_icon(ui.painter(), Rect::from_center_size(rect.center(), Vec2::splat(22.0)), &icon, BG);
+    paint_icon(ui.painter(), Rect::from_center_size(rect.center(), Vec2::splat(24.0)), &icon, BG);
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -364,7 +364,12 @@ pub fn player_icon_button(ui: &mut Ui, icon: Icon, size: f32) -> Response {
             Color32::from_white_alpha(28),
         );
     }
-    paint_icon(ui.painter(), Rect::from_center_size(rect.center(), Vec2::splat(20.0)), &icon, color);
+    let glyph = if matches!(icon, Icon::SkipBack | Icon::SkipForward) {
+        28.0
+    } else {
+        24.0
+    };
+    paint_icon(ui.painter(), Rect::from_center_size(rect.center(), Vec2::splat(glyph)), &icon, color);
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -419,13 +424,32 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: &Icon, color: Color
                 [pixels.width() as usize, pixels.height() as usize],
                 pixels.pixels().map(|pixel| Color32::from_white_alpha(pixel[3])).collect(),
             );
-            let texture = ctx.load_texture(name, mask, egui::TextureOptions::LINEAR);
+            let texture = ctx.load_texture(
+                name,
+                mask,
+                egui::TextureOptions::LINEAR
+                    .with_mipmap_mode(Some(egui::TextureFilter::Linear)),
+            );
             ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
             texture
         });
-        painter.image(texture.id(), rect, Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), color);
+        // Keep the raster on the physical pixel grid. A half-pixel offset is
+        // enough to smear a 24 px glyph on a 100% display.
+        let ppp = painter.ctx().pixels_per_point();
+        let pixel = |value: f32| (value * ppp).round() / ppp;
+        let snapped = Rect::from_center_size(
+            egui::pos2(pixel(c.x), pixel(c.y)),
+            Vec2::splat(pixel(rect.width().min(rect.height()))),
+        );
+        painter.image(texture.id(), snapped, Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), color);
         if matches!(icon, SkipBack | SkipForward) {
-            painter.text(c + Vec2::new(0.0, 1.0), Align2::CENTER_CENTER, "10", semibold(8.0), color);
+            painter.text(
+                egui::pos2(pixel(c.x), pixel(c.y + 1.0)),
+                Align2::CENTER_CENTER,
+                "10",
+                semibold(10.0),
+                color,
+            );
         }
         return;
     }
