@@ -78,10 +78,11 @@ own yt-dlp hook.
 Playback state arrives through libmpv's event loop, which observes `time-pos`,
 `duration`, `pause` and `eof-reached`. That drives the UI *and* the statistics
 honestly — watch time only accrues while mpv reports playing. The video surface
-itself is clickable, and the two-row overlay has a full-width seek bar with a
-hover timestamp, play/pause, 10-second skips, speed presets plus a slider,
-quality, volume/mute and the wide-player toggle. Speed, mute and quality persist
-in the settings table.
+itself is clickable, and its overlay has a full-width seek bar with a hover
+timestamp, play/pause, 10-second skips, mute and fullscreen. The **Playback
+settings** menu keeps volume, quality, speed and the wide-player toggle available
+without crowding the controls on narrower windows. Speed, mute and quality
+persist in the settings table.
 
 Hover previews use a separate muted, looping libmpv instance. After 140 ms the
 stream is prefetched; after 700 ms the thumbnail plays from 10% of its duration
@@ -175,10 +176,14 @@ and in Settings > Local data.
   against the SHA-256 digest GitHub publishes for that asset, and relaunches
   into the new build. It needs to be running from an `.app` bundle; a loose
   `cargo run` binary only ever reports that a release exists.
-- **Windows:** a portable folder cannot be replaced while it is running, so the
-  button downloads the zip, unpacks it into `Downloads\RustTube-<version>` and
-  opens that folder; the runnable files sit in the `RustTube` folder inside it.
-  Quit RustTube, swap it in, done.
+- **Windows:** `Update & restart` downloads and unpacks the release for you.
+  After RustTube closes, an update helper replaces the program files in the
+  existing folder and reopens `RustTube.exe`. Run the packaged `RustTube.exe`
+  from a folder you can write to; no manual download or replacement is needed.
+
+
+On both platforms, your library and settings stay in the separate data folder
+listed below.
 
 Settings > Local data has **Check for updates automatically** (on by default)
 and a manual check. Publishing a release is just tagging: the workflow attaches

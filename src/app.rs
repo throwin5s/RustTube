@@ -3487,18 +3487,19 @@ impl App {
         // No transport controls over a picture that is not on screen yet; the
         // poster and its "Starting…" badge own that state.
         if !snapshot.started || poster.width() < 240.0 || poster.height() < 130.0 {
+            self.playback_menu_open = false;
             return None;
         }
 
         let inset = 12.0;
         let rect = Rect::from_min_max(
-            egui::pos2(poster.left() + inset, poster.bottom() - 100.0),
+            egui::pos2(poster.left() + inset, poster.bottom() - 92.0),
             egui::pos2(poster.right() - inset, poster.bottom() - inset),
         );
         let pointer = ui.ctx().pointer_hover_pos();
         let pointer_over = pointer.is_some_and(|pos| poster.contains(pos));
         let over_hud = pointer.is_some_and(|pos| rect.contains(pos));
-        let menu_open = self.playback_menu_open || ui.ctx().is_popup_open();
+        let menu_open = self.playback_menu_open || over_hud;
         // Show on movement over the picture, while paused, or while using the
         // menu. Resting lets them fade; resting on the controls keeps them up.
         let show = snapshot.paused
@@ -3540,7 +3541,7 @@ impl App {
         };
 
         let (seek_response, seek_line, target) =
-            t::progress(&mut hud, fraction, 8.0, t::ACCENT);
+            t::progress(&mut hud, fraction, 6.0, t::ACCENT);
         if let Some(target) = target {
             if duration > 0.0 {
                 self.player.seek_to(target as f64 * duration);
@@ -3575,27 +3576,29 @@ impl App {
         }
 
         let hud_width = hud.available_width();
-        hud.horizontal(|ui| {
+        hud.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             let (kind, label) = if snapshot.paused {
-                (t::Icon::Play, "Play")
+                (t::Icon::Play, "Play (Space)")
             } else {
-                (t::Icon::Pause, "Pause")
+                (t::Icon::Pause, "Pause (Space)")
             };
-            if t::icon_button(ui, kind, 30.0)
+            if t::icon_button(ui, kind, 34.0)
                 .on_hover_text(label)
                 .clicked()
             {
                 self.player.toggle_pause();
             }
-            if t::icon_button(ui, t::Icon::Back, 26.0)
-                .on_hover_text("Back 10 seconds")
+            if hud_width >= 360.0
+                && t::icon_button(ui, t::Icon::Back, 28.0)
+                    .on_hover_text("Back 10 seconds (J)")
                 .clicked()
             {
                 self.player.seek_to((snapshot.position - 10.0).max(0.0));
             }
-            if t::icon_button(ui, t::Icon::Forward, 26.0)
-                .on_hover_text("Forward 10 seconds")
+            if hud_width >= 360.0
+                && t::icon_button(ui, t::Icon::Forward, 28.0)
+                    .on_hover_text("Forward 10 seconds (L)")
                 .clicked()
             {
                 let limit = if duration > 0.0 { duration } else { f64::MAX };
@@ -3603,17 +3606,17 @@ impl App {
                     .seek_to((snapshot.position + 10.0).min(limit));
             }
 
-            let time_text = if snapshot.started {
+            let time_text = if duration > 0.0 {
                 format!(
                     "{} / {}",
                     t::format_clock(snapshot.position),
                     t::format_clock(duration)
                 )
             } else {
-                "Starting…".to_string()
+                t::format_clock(snapshot.position)
             };
             let _ = ui.add_sized(
-                [88.0, 26.0],
+                [(hud_width - 148.0).clamp(40.0, 116.0), 28.0],
                 egui::Label::new(
                     RichText::new(time_text)
                         .font(t::medium(11.5))
@@ -3622,9 +3625,6 @@ impl App {
                 .truncate(),
             );
 
-            let show_volume = hud_width > 640.0;
-            let show_wide = hud_width > 430.0;
-            let show_quality = hud_width > 390.0;
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 let full = self.fullscreen;
@@ -3633,32 +3633,65 @@ impl App {
                 } else {
                     (t::Icon::Fullscreen, "Fullscreen (F)")
                 };
-                if t::icon_button(ui, full_icon, 28.0)
+                if t::icon_button(ui, full_icon, 32.0)
                     .on_hover_text(full_hint)
                     .clicked()
                 {
                     self.toggle_fullscreen(ui.ctx());
                 }
-                if show_wide {
-                    let wide = ui
-                        .selectable_label(
-                            self.wide_player,
-                            RichText::new("Wide").font(t::medium(11.0)),
-                        )
-                        .on_hover_text("Toggle wide player");
-                    if wide.clicked() {
-                        self.wide_player = !self.wide_player;
-                        self.settings.wide_player = self.wide_player;
-                        let wide_player = self.wide_player;
-                        let _ = self.with_db(|conn| {
-                            db::set_setting(
-                                conn,
-                                "wide_player",
-                                if wide_player { "1" } else { "0" },
-                            )
+                let settings = ui
+                    .add_sized([28.0, 32.0], egui::Button::new(RichText::new("⋯").size(16.0)))
+                    .on_hover_text("Playback settings");
+                let menu = egui::Popup::menu(&settings)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show(|ui| {
+                        ui.set_width(210.0);
+                        ui.strong("Playback settings");
+                        let mut volume = self.player.volume();
+                        if ui
+                            .add(egui::Slider::new(&mut volume, 0..=130).text("Volume").suffix("%"))
+                            .changed()
+                        {
+                            self.set_volume(volume);
+                        }
+                        ui.separator();
+                        ui.label("Quality");
+                        ui.horizontal_wrapped(|ui| {
+                            for option in Quality::ALL {
+                                if ui.selectable_label(self.player.quality == option, option.label()).clicked() {
+                                    self.set_quality(option);
+                                    ui.close();
+                                }
+                            }
                         });
-                    }
-                }
+                        ui.separator();
+                        ui.label("Playback speed");
+                        let mut speed = self.player.speed;
+                        ui.horizontal_wrapped(|ui| {
+                            for (preset, label) in [(0.5, "0.5×"), (0.75, "0.75×"), (1.0, "1×"), (1.25, "1.25×"), (1.5, "1.5×"), (2.0, "2×")] {
+                                if ui.selectable_label((speed - preset).abs() < 0.001, label).clicked() {
+                                    speed = preset;
+                                }
+                            }
+                        });
+                        if ui
+                            .add(egui::Slider::new(&mut speed, 0.25..=4.0).suffix("×").fixed_decimals(2))
+                            .changed()
+                            || (speed - self.player.speed).abs() > 0.001
+                        {
+                            self.set_speed(speed);
+                        }
+                        if !full {
+                            ui.separator();
+                            if ui.checkbox(&mut self.wide_player, "Wide player").changed() {
+                                self.settings.wide_player = self.wide_player;
+                                let value = if self.wide_player { "1" } else { "0" };
+                                let _ = self.with_db(|conn| db::set_setting(conn, "wide_player", value));
+                                ui.close();
+                            }
+                        }
+                    });
+                self.playback_menu_open = menu.is_some();
 
                 let muted = self.player.muted;
                 let (mute_icon, mute_hint) = if muted {
@@ -3666,82 +3699,14 @@ impl App {
                 } else {
                     (t::Icon::Volume, "Mute (M)")
                 };
-                if t::icon_button(ui, mute_icon, 28.0)
+                if t::icon_button(ui, mute_icon, 32.0)
                     .on_hover_text(mute_hint)
                     .clicked()
                 {
                     self.set_muted(!muted);
                 }
-                if show_volume {
-                    if let Some(volume) =
-                        t::volume_slider(ui, self.player.volume() as f32)
-                    {
-                        self.set_volume(volume.round() as i32);
-                    }
-                }
-
-                let mut quality = self.player.quality;
-                if show_quality {
-                    egui::ComboBox::from_id_salt("player-quality")
-                        .selected_text(quality.label())
-                        .width(82.0)
-                        .height(260.0)
-                        .show_ui(ui, |ui| {
-                            for option in Quality::ALL {
-                                ui.selectable_value(&mut quality, option, option.label());
-                            }
-                        });
-                    if quality != self.player.quality {
-                        self.set_quality(quality);
-                    }
-                }
-
-                let mut speed = self.player.speed;
-                let speed_label = format!(
-                    "{}×",
-                    format!("{speed:.2}")
-                        .trim_end_matches('0')
-                        .trim_end_matches('.')
-                );
-                egui::ComboBox::from_id_salt("player-speed")
-                    .selected_text(speed_label)
-                    .width(66.0)
-                    .height(260.0)
-                    .show_ui(ui, |ui| {
-                        ui.spacing_mut().slider_width = 140.0;
-                        for preset in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0] {
-                            let label = format!("{}×", format!("{preset:.2}")
-                                .trim_end_matches('0')
-                                .trim_end_matches('.'));
-                            if ui
-                                .selectable_label(
-                                    (speed - preset).abs() < 0.001,
-                                    label,
-                                )
-                                .clicked()
-                            {
-                                speed = preset;
-                            }
-                        }
-                        ui.separator();
-                        let mut slider = speed as f32;
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut slider, 0.25..=4.0)
-                                    .suffix("×")
-                                    .fixed_decimals(2),
-                            )
-                            .changed()
-                        {
-                            speed = slider as f64;
-                        }
-                    });
-                if (speed - self.player.speed).abs() > 0.001 {
-                    self.set_speed(speed);
-                }
             });
         });
-        self.playback_menu_open = ui.ctx().is_popup_open();
 
         Some(rect)
     }

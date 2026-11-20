@@ -539,38 +539,6 @@ pub fn progress(
     )
 }
 
-/// Compact volume control drawn in the same visual language as the seek bar.
-/// Returns the new 0–130 value while the user clicks or drags it.
-pub fn volume_slider(ui: &mut Ui, value: f32) -> Option<f32> {
-    let width = 140.0;
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click_and_drag());
-    let line = Rect::from_center_size(rect.center(), Vec2::new(width, 8.0));
-    let radius = CornerRadius::same(4);
-    ui.painter().rect_filled(line, radius, PANEL_3);
-    let fraction = (value / 130.0).clamp(0.0, 1.0);
-    let filled = Rect::from_min_size(line.min, Vec2::new(width * fraction, 8.0));
-    if fraction > 0.0 {
-        ui.painter().rect_filled(filled, radius, ACCENT);
-    }
-    ui.painter().circle_filled(
-        egui::pos2(line.left() + width * fraction, line.center().y),
-        if response.hovered() || response.dragged() {
-            7.0
-        } else {
-            5.0
-        },
-        TEXT,
-    );
-    if response.clicked() || response.dragged() {
-        if let Some(pos) = response.interact_pointer_pos() {
-            let ratio = ((pos.x - line.left()) / width).clamp(0.0, 1.0);
-            return Some(ratio * 130.0);
-        }
-    }
-    None
-}
-
 // ----------------------------------------------------------------- formatting
 
 pub fn format_clock(total: f64) -> String {
