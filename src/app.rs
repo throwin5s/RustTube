@@ -261,13 +261,18 @@ impl Thumbs {
         let ctx = ctx.clone();
         let client = self.client.clone();
         self.rt.spawn(async move {
-            let Ok(response) = client.get(&url).send().await else {
-                return;
-            };
-            let Ok(bytes) = response.bytes().await else {
-                return;
-            };
-            let Ok(image) = image::load_from_memory(&bytes) else {
+            let url = url.strip_prefix("//").map(|rest| format!("https://{rest}")).unwrap_or(url);
+            let image = async {
+                let response = client.get(url).send().await.ok()?.error_for_status().ok()?;
+                image::load_from_memory(&response.bytes().await.ok()?).ok()
+            }.await;
+            let Some(image) = image else {
+                // Keep the pending marker during cooldown so redraws don't flood a failed host.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                if let Ok(mut map) = map.lock() {
+                    map.remove(&key);
+                }
+                ctx.request_repaint();
                 return;
             };
             let rgba = image.to_rgba8();
@@ -2154,8 +2159,13 @@ impl App {
             }
             Msg::Detail(id, result) => {
                 if self.route == Route::Watch(id.clone()) {
-                    if let Ok(detail) = &result {
-                        self.detail = Load::Ready((**detail).clone());
+                    if let Ok(mut detail) = result {
+                        if detail.card.channel_avatar.is_empty() {
+                            if let Some(previous) = self.find_card(&id) {
+                                detail.card.channel_avatar = previous.channel_avatar;
+                            }
+                        }
+                        self.detail = Load::Ready((*detail).clone());
                         let card = detail.card.clone();
                         self.maybe_start(&card);
                     } else {
@@ -3514,11 +3524,18 @@ impl App {
         if alpha <= 0.004 {
             return None;
         }
-        ui.painter().rect_filled(
-            rect,
-            CornerRadius::same(12),
-            Color32::from_black_alpha((210.0 * alpha) as u8),
-        );
+        let mut shade = egui::Mesh::default();
+        for (pos, opacity) in [
+            (egui::pos2(poster.left(), rect.top() - 16.0), 0.0),
+            (egui::pos2(poster.right(), rect.top() - 16.0), 0.0),
+            (poster.left_bottom(), 224.0),
+            (poster.right_bottom(), 224.0),
+        ] {
+            shade.colored_vertex(pos, Color32::from_black_alpha((opacity * alpha) as u8));
+        }
+        shade.add_triangle(0, 1, 2);
+        shade.add_triangle(2, 1, 3);
+        ui.painter().add(shade);
 
         let mut hud = ui.new_child(
             egui::UiBuilder::new()
@@ -3541,7 +3558,7 @@ impl App {
         };
 
         let (seek_response, seek_line, target) =
-            t::progress(&mut hud, fraction, 6.0, t::ACCENT);
+            t::progress(&mut hud, fraction, 3.0, t::ACCENT);
         if let Some(target) = target {
             if duration > 0.0 {
                 self.player.seek_to(target as f64 * duration);
@@ -3639,8 +3656,7 @@ impl App {
                 {
                     self.toggle_fullscreen(ui.ctx());
                 }
-                let settings = ui
-                    .add_sized([28.0, 32.0], egui::Button::new(RichText::new("⋯").size(16.0)))
+                let settings = t::icon_button(ui, t::Icon::More, 32.0)
                     .on_hover_text("Playback settings");
                 let menu = egui::Popup::menu(&settings)
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)

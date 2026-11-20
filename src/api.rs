@@ -587,8 +587,11 @@ fn pick_avatar(v: &Value, key: &str) -> String {
     // Prefer a crisp mid-size avatar; fall back to the largest available.
     let mut best: Option<(&Value, u64)> = None;
     for item in arr {
+        if item.get("url").and_then(Value::as_str).unwrap_or("").trim().is_empty() {
+            continue;
+        }
         let width = item.get("width").and_then(|w| w.as_u64()).unwrap_or(0);
-        let score = if width >= 76 && width <= 176 { width } else { 0 };
+        let score = if (76..=176).contains(&width) { u64::MAX - (176 - width) } else { width };
         if best.map(|(_, b)| score > b).unwrap_or(true) {
             best = Some((item, score));
         }
@@ -605,12 +608,12 @@ fn pick_banner(v: &Value, key: &str) -> String {
 }
 
 fn clean_description(v: &Value) -> String {
-    let raw = v
-        .get("description")
-        .and_then(|x| x.as_str())
-        .or_else(|| v.get("shortDescription").and_then(|x| x.as_str()))
-        .unwrap_or("");
-    strip_html(raw)
+    ["description", "shortDescription", "descriptionHtml"]
+        .iter()
+        .filter_map(|key| v.get(*key)?.as_str())
+        .map(strip_html)
+        .find(|text| !text.is_empty())
+        .unwrap_or_default()
 }
 
 fn strip_html(raw: &str) -> String {

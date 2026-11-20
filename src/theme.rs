@@ -318,6 +318,7 @@ pub fn nav_row(ui: &mut Ui, label: &str, active: bool) -> Response {
 /// Small monochrome transport/status icons painted with shapes.
 pub enum Icon {
     Play,
+    More,
     Pause,
     Back,
     Forward,
@@ -343,6 +344,11 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: &Icon, color: Color
     let c = rect.center();
     let s = rect.width().min(rect.height()) * 0.5;
     match icon {
+        Icon::More => {
+            for offset in [-0.4, 0.0, 0.4] {
+                painter.circle_filled(c + Vec2::new(offset * s, 0.0), s * 0.11, color);
+            }
+        }
         Icon::Play => {
             let points = vec![
                 egui::pos2(c.x - s * 0.32, c.y - s * 0.44),
@@ -505,7 +511,7 @@ pub fn progress(
     hovered_fill: Color32,
 ) -> (Response, Rect, Option<f32>) {
     let width = ui.available_width();
-    let thickness = height.max(6.0);
+    let thickness = height.max(1.0);
     // Give the bar a generous invisible hit area so it is easy to grab.
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click_and_drag());
     let line = Rect::from_center_size(rect.center(), Vec2::new(width, thickness));
@@ -519,19 +525,11 @@ pub fn progress(
     if shown > 0.0 {
         ui.painter().rect_filled(filled, radius, hovered_fill);
     }
-    let knob_radius = if response.hovered() || response.dragged() {
-        7.0
-    } else {
-        5.0
-    };
-    ui.painter().circle_filled(
-        egui::pos2(
-            filled.right().max(line.left() + thickness * 0.5),
-            line.center().y,
-        ),
-        knob_radius,
-        TEXT,
-    );
+    if response.hovered() || response.dragged() || response.has_focus() {
+        ui.painter().circle_filled(
+            egui::pos2(filled.right(), line.center().y), 6.0, TEXT,
+        );
+    }
     (
         response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal),
         line,
