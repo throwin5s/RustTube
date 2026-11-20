@@ -16,7 +16,7 @@ turned off in Settings.
 ## Interface
 
 Red-on-black, native widgets, drawn by egui itself — no HTML, no CSS, no icon
-font. Layout follows the same shape as Spotifast: a sidebar with navigation and
+font. Player glyphs use bundled [Lucide 0.468.0](https://github.com/lucide-icons/lucide/tree/f12b0de177fbc2a6795e99be065887e72b237123) icons ([license](assets/lucide/LICENSE)). Layout follows the same shape as Spotifast: a sidebar with navigation and
 your subscriptions, a top bar with search and sync state, a scrolling content
 area, and a player bar pinned to the bottom once something is playing.
 
@@ -26,7 +26,7 @@ area, and a player bar pinned to the bottom once something is playing.
 | Search | Channels and videos, with live channel suggestions (icon + name) as you type |
 | Subscriptions | Latest uploads from the channels you follow |
 | Channel | Banner, avatar, subscriber count, subscribe toggle, full upload list |
-| Watch | Two-row player controls, title, likes, description, related rail |
+| Watch | Player overlay, channel row, expandable description, and Up next |
 | History | Resume points, per-item progress, remove and clear |
 | Statistics | Total/weekly watch time, videos opened, streak, 30-day chart, top channels |
 | Settings | Playback defaults, interface options, instance, region, history, cloud sync, local data |
@@ -78,11 +78,13 @@ own yt-dlp hook.
 Playback state arrives through libmpv's event loop, which observes `time-pos`,
 `duration`, `pause` and `eof-reached`. That drives the UI *and* the statistics
 honestly — watch time only accrues while mpv reports playing. The video surface
-itself is clickable, and its overlay has a full-width seek bar with a hover
-timestamp, play/pause, 10-second skips, mute and fullscreen. The **Playback
-settings** menu keeps volume, quality, speed and the wide-player toggle available
-without crowding the controls on narrower windows. Speed, mute and quality
-persist in the settings table.
+itself is clickable, and its overlay has a slim seek bar with a hover timestamp,
+play/pause, 10-second skips, mute, fullscreen and a **Playback settings** menu
+for volume, quality and speed. The bookmark menu saves videos or adds them to a
+playlist. The wide-player toggle lives in Settings. Speed, mute and quality
+persist in the settings table. When the instance APIs fail or return no
+description, RustTube asks the bundled yt-dlp for public metadata without
+interrupting playback.
 
 Hover previews use a separate muted, looping libmpv instance. After 140 ms the
 stream is prefetched; after 700 ms the thumbnail plays from 10% of its duration

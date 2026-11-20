@@ -5,8 +5,7 @@
 //! sentence-case section titles, and a restrained type scale (11.5 → 22). The
 //! accent stays RustTube red; Spotifast's green is one constant away.
 //!
-//! Everything is drawn by egui itself: no icon font, no webview, no images
-//! beyond the thumbnails RustTube fetches.
+//! egui draws the interface, including the bundled Lucide player icons.
 
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Rect,
@@ -316,12 +315,17 @@ pub fn nav_row(ui: &mut Ui, label: &str, active: bool) -> Response {
 // --------------------------------------------------------------------- icons
 
 /// Small monochrome transport/status icons painted with shapes.
+#[derive(Clone, Copy)]
 pub enum Icon {
     Play,
-    More,
+    Settings,
+    Bookmark,
+    BookmarkCheck,
     Pause,
     Back,
     Forward,
+    SkipBack,
+    SkipForward,
     Sidebar,
     Volume,
     VolumeMuted,
@@ -329,47 +333,103 @@ pub enum Icon {
     ExitFullscreen,
 }
 
-pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32) -> Response {
+/// Bright primary transport control: a solid disc that stays legible over
+/// bright video frames.
+pub fn player_primary_button(ui: &mut Ui, icon: Icon, size: f32) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
-    let color = if response.hovered() { TEXT } else { DIM };
-    if response.hovered() {
-        ui.painter()
-            .circle_filled(rect.center(), size * 0.46, PANEL_3);
-    }
-    paint_icon(ui.painter(), rect, &icon, color);
+    let fill = if response.hovered() {
+        Color32::WHITE
+    } else {
+        Color32::from_rgb(0xe8, 0xec, 0xf1)
+    };
+    ui.painter()
+        .circle_filled(rect.center(), size * 0.5, fill);
+    paint_icon(ui.painter(), Rect::from_center_size(rect.center(), Vec2::splat(22.0)), &icon, BG);
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Quiet utility control for the video overlay: white glyph, translucent
+/// circular hover, no opaque widget background.
+pub fn player_icon_button(ui: &mut Ui, icon: Icon, size: f32) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
+    let color = if matches!(icon, Icon::BookmarkCheck) {
+        ACCENT_SOFT
+    } else {
+        TEXT
+    };
+    if response.hovered() || response.has_focus() {
+        ui.painter().circle_filled(
+            rect.center(),
+            size * 0.5,
+            Color32::from_white_alpha(28),
+        );
+    }
+    paint_icon(ui.painter(), Rect::from_center_size(rect.center(), Vec2::splat(20.0)), &icon, color);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Small pill used for the quality and speed choices in the playback menu.
+pub fn choice_chip(ui: &mut Ui, selected: bool, label: &str) -> Response {
+    let text = RichText::new(label)
+        .font(if selected { semibold(11.5) } else { medium(11.5) })
+        .color(if selected { Color32::WHITE } else { DIM });
+    ui.add(
+        egui::Button::new(text)
+            .fill(if selected {
+                ACCENT
+            } else {
+                Color32::from_white_alpha(8)
+            })
+            .stroke(if selected {
+                Stroke::NONE
+            } else {
+                Stroke::new(1.0_f32, Color32::from_white_alpha(16))
+            })
+            .corner_radius(CornerRadius::same(6))
+            .min_size(Vec2::new(0.0, 24.0)),
+    )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: &Icon, color: Color32) {
     let c = rect.center();
     let s = rect.width().min(rect.height()) * 0.5;
+    use Icon::*;
+    let asset = match icon {
+        Play => Some(("play", &include_bytes!("../assets/lucide/play.png")[..])),
+        Pause => Some(("pause", &include_bytes!("../assets/lucide/pause.png")[..])),
+        Settings => Some(("settings", &include_bytes!("../assets/lucide/settings.png")[..])),
+        Bookmark => Some(("bookmark", &include_bytes!("../assets/lucide/bookmark.png")[..])),
+        BookmarkCheck => Some(("bookmark-check", &include_bytes!("../assets/lucide/bookmark-check.png")[..])),
+        SkipBack => Some(("rotate-ccw", &include_bytes!("../assets/lucide/rotate-ccw.png")[..])),
+        SkipForward => Some(("rotate-cw", &include_bytes!("../assets/lucide/rotate-cw.png")[..])),
+        Volume => Some(("volume-2", &include_bytes!("../assets/lucide/volume-2.png")[..])),
+        VolumeMuted => Some(("volume-x", &include_bytes!("../assets/lucide/volume-x.png")[..])),
+        Fullscreen => Some(("maximize", &include_bytes!("../assets/lucide/maximize.png")[..])),
+        ExitFullscreen => Some(("minimize", &include_bytes!("../assets/lucide/minimize.png")[..])),
+        Back | Forward | Sidebar => None,
+    };
+    if let Some((name, bytes)) = asset {
+        let ctx = painter.ctx();
+        let id = egui::Id::new(("lucide", name));
+        let cached = ctx.data(|data| data.get_temp::<egui::TextureHandle>(id));
+        let texture = cached.unwrap_or_else(|| {
+            let pixels = image::load_from_memory(bytes).expect("bundled Lucide PNG").to_rgba8();
+            let mask = egui::ColorImage::new(
+                [pixels.width() as usize, pixels.height() as usize],
+                pixels.pixels().map(|pixel| Color32::from_white_alpha(pixel[3])).collect(),
+            );
+            let texture = ctx.load_texture(name, mask, egui::TextureOptions::LINEAR);
+            ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
+            texture
+        });
+        painter.image(texture.id(), rect, Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), color);
+        if matches!(icon, SkipBack | SkipForward) {
+            painter.text(c + Vec2::new(0.0, 1.0), Align2::CENTER_CENTER, "10", semibold(8.0), color);
+        }
+        return;
+    }
     match icon {
-        Icon::More => {
-            for offset in [-0.4, 0.0, 0.4] {
-                painter.circle_filled(c + Vec2::new(offset * s, 0.0), s * 0.11, color);
-            }
-        }
-        Icon::Play => {
-            let points = vec![
-                egui::pos2(c.x - s * 0.32, c.y - s * 0.44),
-                egui::pos2(c.x - s * 0.32, c.y + s * 0.44),
-                egui::pos2(c.x + s * 0.46, c.y),
-            ];
-            painter.add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
-        }
-        Icon::Pause => {
-            let w = s * 0.18;
-            painter.rect_filled(
-                Rect::from_min_size(egui::pos2(c.x - s * 0.34, c.y - s * 0.42), Vec2::new(w, s * 0.84)),
-                CornerRadius::same(RADIUS_SMALL),
-                color,
-            );
-            painter.rect_filled(
-                Rect::from_min_size(egui::pos2(c.x + s * 0.16, c.y - s * 0.42), Vec2::new(w, s * 0.84)),
-                CornerRadius::same(RADIUS_SMALL),
-                color,
-            );
-        }
         Icon::Back => {
             painter.add(egui::Shape::line(
                 vec![
@@ -390,40 +450,6 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: &Icon, color: Color
                 Stroke::new(1.8_f32, color),
             ));
         }
-        Icon::Fullscreen => {
-            // Four brackets opening outwards, the usual fullscreen glyph.
-            let stroke = Stroke::new(1.7_f32, color);
-            let reach = s * 0.42;
-            let arm = s * 0.24;
-            for (sx, sy) in [(-1.0_f32, -1.0_f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-                let corner = egui::pos2(c.x + sx * reach, c.y + sy * reach);
-                painter.add(egui::Shape::line(
-                    vec![egui::pos2(corner.x, corner.y - sy * arm), corner],
-                    stroke,
-                ));
-                painter.add(egui::Shape::line(
-                    vec![egui::pos2(corner.x - sx * arm, corner.y), corner],
-                    stroke,
-                ));
-            }
-        }
-        Icon::ExitFullscreen => {
-            // Same brackets, turned inwards: the arrows point at the middle.
-            let stroke = Stroke::new(1.7_f32, color);
-            let reach = s * 0.32;
-            let arm = s * 0.24;
-            for (sx, sy) in [(-1.0_f32, -1.0_f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-                let inner = egui::pos2(c.x + sx * reach, c.y + sy * reach);
-                painter.add(egui::Shape::line(
-                    vec![egui::pos2(inner.x + sx * arm, inner.y), inner],
-                    stroke,
-                ));
-                painter.add(egui::Shape::line(
-                    vec![inner, egui::pos2(inner.x, inner.y + sy * arm)],
-                    stroke,
-                ));
-            }
-        }
         Icon::Sidebar => {
             for offset in [-0.32, 0.0, 0.32] {
                 painter.rect_filled(
@@ -436,57 +462,7 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: &Icon, color: Color
                 );
             }
         }
-        Icon::Volume | Icon::VolumeMuted => {
-            painter.rect_filled(
-                Rect::from_center_size(
-                    egui::pos2(c.x - s * 0.26, c.y),
-                    Vec2::new(s * 0.30, s * 0.34),
-                ),
-                CornerRadius::same(1),
-                color,
-            );
-            painter.add(egui::Shape::convex_polygon(
-                vec![
-                    egui::pos2(c.x - s * 0.12, c.y - s * 0.18),
-                    egui::pos2(c.x - s * 0.12, c.y + s * 0.18),
-                    egui::pos2(c.x + s * 0.12, c.y + s * 0.38),
-                    egui::pos2(c.x + s * 0.12, c.y - s * 0.38),
-                ],
-                color,
-                Stroke::NONE,
-            ));
-            if matches!(icon, Icon::VolumeMuted) {
-                painter.add(egui::Shape::line(
-                    vec![
-                        egui::pos2(c.x + s * 0.22, c.y - s * 0.22),
-                        egui::pos2(c.x + s * 0.48, c.y + s * 0.22),
-                    ],
-                    Stroke::new(1.8_f32, color),
-                ));
-                painter.add(egui::Shape::line(
-                    vec![
-                        egui::pos2(c.x + s * 0.48, c.y - s * 0.22),
-                        egui::pos2(c.x + s * 0.22, c.y + s * 0.22),
-                    ],
-                    Stroke::new(1.8_f32, color),
-                ));
-            } else {
-                painter.add(egui::Shape::line(
-                    vec![
-                        egui::pos2(c.x + s * 0.28, c.y - s * 0.14),
-                        egui::pos2(c.x + s * 0.28, c.y + s * 0.14),
-                    ],
-                    Stroke::new(1.4_f32, color),
-                ));
-                painter.add(egui::Shape::line(
-                    vec![
-                        egui::pos2(c.x + s * 0.42, c.y - s * 0.28),
-                        egui::pos2(c.x + s * 0.42, c.y + s * 0.28),
-                    ],
-                    Stroke::new(1.4_f32, color),
-                ));
-            }
-        }
+        _ => unreachable!("player icons have bundled assets"),
     }
 }
 
@@ -506,21 +482,25 @@ pub fn placeholder_thumbnail(painter: &egui::Painter, rect: Rect) {
 /// absolute position instead of accumulating relative seeks.
 pub fn progress(
     ui: &mut Ui,
+    width: f32,
     fraction: f32,
     height: f32,
     hovered_fill: Color32,
 ) -> (Response, Rect, Option<f32>) {
-    let width = ui.available_width();
-    let thickness = height.max(1.0);
-    // Give the bar a generous invisible hit area so it is easy to grab.
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click_and_drag());
+    let width = width.max(1.0);
+    // Give the bar a generous invisible hit area so it is easy to grab, but
+    // keep the resting line hairline-thin and let it grow under the pointer.
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::click_and_drag());
+    let active = response.hovered() || response.dragged();
+    let thickness = height + if active { 2.0 } else { 0.0 };
     let line = Rect::from_center_size(rect.center(), Vec2::new(width, thickness));
     let target = response.interact_pointer_pos().and_then(|pos| {
         (width > 0.0).then(|| ((pos.x - line.left()) / width).clamp(0.0, 1.0))
     });
     let shown = target.unwrap_or(fraction).clamp(0.0, 1.0);
     let radius = CornerRadius::same((thickness * 0.5).round() as u8);
-    ui.painter().rect_filled(line, radius, PANEL_3);
+    ui.painter()
+        .rect_filled(line, radius, Color32::from_white_alpha(46));
     let filled = Rect::from_min_size(line.min, Vec2::new(width * shown, thickness));
     if shown > 0.0 {
         ui.painter().rect_filled(filled, radius, hovered_fill);
@@ -530,8 +510,11 @@ pub fn progress(
             egui::pos2(filled.right(), line.center().y), 6.0, TEXT,
         );
     }
+    if response.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     (
-        response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal),
+        response.on_hover_cursor(egui::CursorIcon::PointingHand),
         line,
         target,
     )
@@ -647,6 +630,31 @@ pub fn initials(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeline_keeps_pointing_hand_while_dragging_off_track() {
+        let ctx = egui::Context::default();
+        let mut track = Rect::NOTHING;
+        let mut frame = |events| {
+            ctx.run(egui::RawInput { events, ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    track = progress(ui, 200.0, 0.3, 3.0, ACCENT).0.rect;
+                });
+            }).platform_output.cursor_icon
+        };
+        // The first widget begins at the default panel margin.
+        frame(vec![]);
+        let inside = egui::pos2(50.0, 20.0);
+        let outside = egui::pos2(110.0, 65.0);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos, pressed, button: egui::PointerButton::Primary, modifiers: egui::Modifiers::NONE,
+        };
+        assert_eq!(frame(vec![egui::Event::PointerMoved(inside)]), egui::CursorIcon::PointingHand);
+        frame(vec![button(inside, true)]);
+        assert_eq!(frame(vec![egui::Event::PointerMoved(outside)]), egui::CursorIcon::PointingHand);
+        assert_eq!(frame(vec![button(outside, false)]), egui::CursorIcon::Default);
+        assert!(track.contains(inside) && !track.contains(outside));
+    }
 
     #[test]
     fn ease_out_cubic_is_clamped_and_monotonic() {

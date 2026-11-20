@@ -111,7 +111,8 @@ enum Msg {
     Feed(Result<Vec<VideoCard>, String>),
     Channel(String, Result<ChannelSummary, String>),
     ChannelMore(String, Vec<VideoCard>),
-    Detail(String, Result<Box<VideoDetail>, String>),
+    Detail(String, u64, Result<Box<VideoDetail>, String>),
+    Description(String, u64, Result<Box<VideoDetail>, String>),
     SubAvatar(String, Option<String>),
     Sync(Result<SyncReport, String>),
     UpdateCheck(Result<Option<Release>, String>),
@@ -709,6 +710,8 @@ pub struct App {
     channel_page: u32,
     detail: Load<VideoDetail>,
     detail_id: String,
+    detail_request: u64,
+    description: Load<String>,
     history: Load<Vec<HistoryEntry>>,
     stats: Load<StatsOverview>,
     saved: Load<Vec<db::SavedEntry>>,
@@ -730,6 +733,8 @@ pub struct App {
     wide_player: bool,
     preview_enabled: bool,
     playback_menu_open: bool,
+    bookmark_menu_open: bool,
+    scrubbing: bool,
     sidebar_visible: bool,
     /// Optional hover-to-reveal behaviour for the sidebar.
     sidebar_hover: bool,
@@ -884,6 +889,8 @@ impl App {
             channel_page: 1,
             detail: Load::Idle,
             detail_id: String::new(),
+            detail_request: 0,
+            description: Load::Idle,
             history: Load::Idle,
             stats: Load::Idle,
             saved: Load::Idle,
@@ -902,6 +909,8 @@ impl App {
             wide_player: false,
             preview_enabled,
             playback_menu_open: false,
+            bookmark_menu_open: false,
+            scrubbing: false,
             sidebar_visible,
             sidebar_hover,
             sidebar_reveal: if sidebar_visible { 1.0 } else { 0.0 },
@@ -1099,6 +1108,11 @@ impl App {
     /// stream or a video leaves it running under the next page.
     fn leave_watch(&mut self) {
         if matches!(self.route, Route::Watch(_)) {
+            self.invalidate_pending_detail();
+            self.playlist_picker = false;
+            self.bookmark_menu_open = false;
+            self.playback_menu_open = false;
+            self.scrubbing = false;
             if self.fullscreen {
                 self.fullscreen = false;
                 self.fullscreen_pending = Some(false);
@@ -1222,12 +1236,35 @@ impl App {
         if self.detail.is_idle() || self.detail_id != id {
             self.detail_id = id.to_string();
             self.detail = Load::Loading;
-            let api = self.api.clone();
-            let requested = id.to_string();
-            self.spawn(async move {
-                Msg::Detail(requested.clone(), api.video(&requested).await.map(Box::new))
-            });
+            self.request_detail(id);
         }
+    }
+
+    fn request_detail(&mut self, id: &str) {
+        self.detail_request += 1;
+        self.description = Load::Loading;
+        let request = self.detail_request;
+        let api = self.api.clone();
+        let id = id.to_string();
+        self.spawn(async move {
+            let result = tokio::time::timeout(Duration::from_secs(12), api.video(&id))
+                .await
+                .unwrap_or_else(|_| Err("The video API timed out".into()));
+            Msg::Detail(id, request, result.map(Box::new))
+        });
+    }
+
+    fn invalidate_pending_detail(&mut self) {
+        if matches!(self.description, Load::Loading) {
+            self.detail_request += 1;
+            self.detail_id.clear();
+        }
+    }
+
+    fn expects_detail(&self, id: &str, request: u64) -> bool {
+        request == self.detail_request && self.detail_id == id
+            && (matches!(&self.route, Route::Watch(active) if active == id)
+                || self.opening.as_ref().is_some_and(|open| open.card.id == id))
     }
 
     fn ensure_loaded(&mut self) {
@@ -2157,19 +2194,68 @@ impl App {
                     self.channel = loaded(result);
                 }
             }
-            Msg::Detail(id, result) => {
-                if self.route == Route::Watch(id.clone()) {
-                    if let Ok(mut detail) = result {
-                        if detail.card.channel_avatar.is_empty() {
-                            if let Some(previous) = self.find_card(&id) {
-                                detail.card.channel_avatar = previous.channel_avatar;
-                            }
+            Msg::Detail(id, request, result) => {
+                if !self.expects_detail(&id, request) {
+                    return;
+                }
+                if let Ok(mut detail) = result {
+                    if detail.card.channel_avatar.is_empty() {
+                        if let Some(previous) = self.find_card(&id) {
+                            detail.card.channel_avatar = previous.channel_avatar;
                         }
-                        self.detail = Load::Ready((*detail).clone());
-                        let card = detail.card.clone();
-                        self.maybe_start(&card);
-                    } else {
-                        self.detail = loaded(result.map(|boxed| *boxed));
+                    }
+                    let card = detail.card.clone();
+                    let has_description = !detail.description.trim().is_empty();
+                    if has_description {
+                        self.description = Load::Ready(detail.description.clone());
+                    }
+                    self.detail = Load::Ready(*detail);
+                    self.maybe_start(&card);
+                    if has_description {
+                        return;
+                    }
+                }
+                self.spawn(async move {
+                    let started = Instant::now();
+                    let result = stream::video_metadata(&id).await
+                        .and_then(|value| crate::api::ytdlp_detail(&value, &id));
+                    if stream::timing_enabled() && result.is_ok() {
+                        eprintln!("yt-dlp metadata recovered for {id} in {:?}", started.elapsed());
+                    }
+                    Msg::Description(id, request, result.map(Box::new))
+                });
+            }
+            Msg::Description(id, request, result) => {
+                if !self.expects_detail(&id, request) {
+                    return;
+                }
+                match result {
+                    Ok(mut fallback) => {
+                        self.description = Load::Ready(std::mem::take(&mut fallback.description));
+                        if self.detail.ready().is_none() {
+                            if let Some(card) = self.find_card(&id) {
+                                // The listing may have the avatar and published text yt-dlp lacks.
+                                fallback.card.channel_avatar = card.channel_avatar;
+                                if !card.channel_id.is_empty() {
+                                    fallback.card.channel_id = card.channel_id;
+                                }
+                                if !card.channel_name.is_empty() {
+                                    fallback.card.channel_name = card.channel_name;
+                                }
+                                if !card.published.is_empty() {
+                                    fallback.card.published = card.published;
+                                    fallback.card.published_unix = card.published_unix;
+                                }
+                            }
+                            // This is metadata only; do not start or restart the player.
+                            self.detail = Load::Ready(*fallback);
+                        }
+                    }
+                    Err(err) => {
+                        if self.detail.ready().is_none() {
+                            self.detail = Load::Failed("Video details couldn’t be loaded.".into());
+                        }
+                        self.description = Load::Failed(err);
                     }
                 }
             }
@@ -2820,6 +2906,7 @@ impl App {
     /// already started, so a cancelled open never plays under the grid.
     fn cancel_opening(&mut self) {
         if self.opening.take().is_some() {
+            self.invalidate_pending_detail();
             if self.player.is_active() {
                 self.player.stop();
                 self.attempted = None;
@@ -3487,6 +3574,10 @@ impl App {
     /// MPV-style controls that sit on the video instead of taking up another
     /// row below it. They appear while the pointer is over the picture, and
     /// stay visible when playback is paused.
+    fn has_player_hud(poster: Rect) -> bool {
+        poster.width() >= 280.0 && poster.height() >= 130.0
+    }
+
     fn video_hud(
         &mut self,
         ui: &mut Ui,
@@ -3496,23 +3587,26 @@ impl App {
     ) -> Option<Rect> {
         // No transport controls over a picture that is not on screen yet; the
         // poster and its "Starting…" badge own that state.
-        if !snapshot.started || poster.width() < 240.0 || poster.height() < 130.0 {
+        if !snapshot.started || !Self::has_player_hud(poster) {
             self.playback_menu_open = false;
+            self.scrubbing = false;
             return None;
         }
 
-        let inset = 12.0;
+        let inset = 14.0;
         let rect = Rect::from_min_max(
-            egui::pos2(poster.left() + inset, poster.bottom() - 92.0),
+            egui::pos2(poster.left() + inset, poster.bottom() - 94.0),
             egui::pos2(poster.right() - inset, poster.bottom() - inset),
         );
         let pointer = ui.ctx().pointer_hover_pos();
         let pointer_over = pointer.is_some_and(|pos| poster.contains(pos));
         let over_hud = pointer.is_some_and(|pos| rect.contains(pos));
-        let menu_open = self.playback_menu_open || over_hud;
+        let menu_open = self.playback_menu_open || self.bookmark_menu_open || over_hud;
         // Show on movement over the picture, while paused, or while using the
         // menu. Resting lets them fade; resting on the controls keeps them up.
         let show = snapshot.paused
+            || self.shot_path.is_some()
+            || self.scrubbing
             || menu_open
             || (pointer_over
                 && (self.last_pointer_move.elapsed() < Duration::from_millis(2200) || over_hud));
@@ -3526,10 +3620,10 @@ impl App {
         }
         let mut shade = egui::Mesh::default();
         for (pos, opacity) in [
-            (egui::pos2(poster.left(), rect.top() - 16.0), 0.0),
-            (egui::pos2(poster.right(), rect.top() - 16.0), 0.0),
-            (poster.left_bottom(), 224.0),
-            (poster.right_bottom(), 224.0),
+            (egui::pos2(poster.left(), rect.top() - 30.0), 0.0),
+            (egui::pos2(poster.right(), rect.top() - 30.0), 0.0),
+            (poster.left_bottom(), 232.0),
+            (poster.right_bottom(), 232.0),
         ] {
             shade.colored_vertex(pos, Color32::from_black_alpha((opacity * alpha) as u8));
         }
@@ -3540,11 +3634,11 @@ impl App {
         let mut hud = ui.new_child(
             egui::UiBuilder::new()
                 .id_salt("video-hud")
-                .max_rect(rect.shrink2(Vec2::new(12.0, 7.0)))
+                .max_rect(rect.shrink2(Vec2::new(14.0, 8.0)))
                 .layout(Layout::top_down(Align::Min)),
         );
         hud.set_opacity(alpha);
-        hud.spacing_mut().item_spacing = Vec2::new(6.0, 2.0);
+        hud.spacing_mut().item_spacing = Vec2::new(0.0, 4.0);
 
         let duration = if snapshot.duration > 0.0 {
             snapshot.duration
@@ -3558,7 +3652,8 @@ impl App {
         };
 
         let (seek_response, seek_line, target) =
-            t::progress(&mut hud, fraction, 3.0, t::ACCENT);
+            t::progress(&mut hud, rect.width() - 28.0, fraction, 3.0, t::ACCENT);
+        self.scrubbing = seek_response.dragged();
         if let Some(target) = target {
             if duration > 0.0 {
                 self.player.seek_to(target as f64 * duration);
@@ -3571,10 +3666,10 @@ impl App {
                 let label = t::format_clock(target * duration);
                 let galley = hud.painter().layout_no_wrap(
                     label,
-                    t::medium(11.0),
+                    t::semibold(11.5),
                     t::TEXT,
                 );
-                let padding = Vec2::new(6.0, 3.0);
+                let padding = Vec2::new(7.0, 3.0);
                 let size = galley.size() + padding * 2.0;
                 let x = (seek_line.left() + seek_line.width() * target as f32 - size.x / 2.0)
                     .clamp(rect.left() + 4.0, rect.right() - size.x - 4.0);
@@ -3584,8 +3679,8 @@ impl App {
                 );
                 hud.painter().rect_filled(
                     tooltip,
-                    CornerRadius::same(t::RADIUS_SMALL),
-                    Color32::from_black_alpha(235),
+                    CornerRadius::same(6),
+                    Color32::from_black_alpha(230),
                 );
                 hud.painter()
                     .galley(tooltip.min + padding, galley, t::TEXT);
@@ -3593,129 +3688,210 @@ impl App {
         }
 
         let hud_width = hud.available_width();
-        hud.horizontal_centered(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
+        hud.add_space(3.0);
+        hud.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
             let (kind, label) = if snapshot.paused {
                 (t::Icon::Play, "Play (Space)")
             } else {
                 (t::Icon::Pause, "Pause (Space)")
             };
-            if t::icon_button(ui, kind, 34.0)
+            if t::player_primary_button(ui, kind, 38.0)
                 .on_hover_text(label)
                 .clicked()
             {
                 self.player.toggle_pause();
             }
-            if hud_width >= 360.0
-                && t::icon_button(ui, t::Icon::Back, 28.0)
+            if hud_width >= 380.0 {
+                ui.add_space(4.0);
+                if t::player_icon_button(ui, t::Icon::SkipBack, 34.0)
                     .on_hover_text("Back 10 seconds (J)")
-                .clicked()
-            {
-                self.player.seek_to((snapshot.position - 10.0).max(0.0));
-            }
-            if hud_width >= 360.0
-                && t::icon_button(ui, t::Icon::Forward, 28.0)
+                    .clicked()
+                {
+                    self.player.seek_to((snapshot.position - 10.0).max(0.0));
+                }
+                if t::player_icon_button(ui, t::Icon::SkipForward, 34.0)
                     .on_hover_text("Forward 10 seconds (L)")
-                .clicked()
-            {
-                let limit = if duration > 0.0 { duration } else { f64::MAX };
-                self.player
-                    .seek_to((snapshot.position + 10.0).min(limit));
+                    .clicked()
+                {
+                    let limit = if duration > 0.0 { duration } else { f64::MAX };
+                    self.player
+                        .seek_to((snapshot.position + 10.0).min(limit));
+                }
             }
 
-            let time_text = if duration > 0.0 {
-                format!(
-                    "{} / {}",
-                    t::format_clock(snapshot.position),
-                    t::format_clock(duration)
-                )
-            } else {
-                t::format_clock(snapshot.position)
-            };
-            let _ = ui.add_sized(
-                [(hud_width - 148.0).clamp(40.0, 116.0), 28.0],
-                egui::Label::new(
-                    RichText::new(time_text)
-                        .font(t::medium(11.5))
-                        .color(t::TEXT),
-                )
-                .truncate(),
+            ui.add_space(14.0);
+            let mut time = egui::text::LayoutJob::default();
+            time.append(
+                &t::format_clock(snapshot.position),
+                0.0,
+                egui::TextFormat {
+                    font_id: t::semibold(12.5),
+                    color: t::TEXT,
+                    ..Default::default()
+                },
+            );
+            if duration > 0.0 {
+                time.append(
+                    " / ",
+                    0.0,
+                    egui::TextFormat {
+                        font_id: t::medium(10.5),
+                        color: t::DIM_2,
+                        ..Default::default()
+                    },
+                );
+                time.append(
+                    &t::format_clock(duration),
+                    0.0,
+                    egui::TextFormat {
+                        font_id: t::medium(12.0),
+                        color: t::DIM,
+                        ..Default::default()
+                    },
+                );
+            }
+            ui.allocate_ui_with_layout(
+                Vec2::new((hud_width - if hud_width >= 380.0 { 272.0 } else { 200.0 }).clamp(24.0, 112.0), 38.0),
+                Layout::left_to_right(Align::Center),
+                |ui| { ui.add(egui::Label::new(time).truncate().selectable(false)); },
             );
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.spacing_mut().item_spacing.x = 2.0;
                 let full = self.fullscreen;
                 let (full_icon, full_hint) = if full {
                     (t::Icon::ExitFullscreen, "Exit fullscreen (Esc)")
                 } else {
                     (t::Icon::Fullscreen, "Fullscreen (F)")
                 };
-                if t::icon_button(ui, full_icon, 32.0)
+                if t::player_icon_button(ui, full_icon, 34.0)
                     .on_hover_text(full_hint)
                     .clicked()
                 {
                     self.toggle_fullscreen(ui.ctx());
                 }
-                let settings = t::icon_button(ui, t::Icon::More, 32.0)
+                let settings = t::player_icon_button(ui, t::Icon::Settings, 34.0)
                     .on_hover_text("Playback settings");
-                let menu = egui::Popup::menu(&settings)
+                let mut popup = egui::Popup::menu(&settings)
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                    .show(|ui| {
-                        ui.set_width(210.0);
-                        ui.strong("Playback settings");
-                        let mut volume = self.player.volume();
-                        if ui
-                            .add(egui::Slider::new(&mut volume, 0..=130).text("Volume").suffix("%"))
-                            .changed()
-                        {
-                            self.set_volume(volume);
-                        }
-                        ui.separator();
-                        ui.label("Quality");
-                        ui.horizontal_wrapped(|ui| {
-                            for option in Quality::ALL {
-                                if ui.selectable_label(self.player.quality == option, option.label()).clicked() {
-                                    self.set_quality(option);
-                                    ui.close();
+                    .align(egui::RectAlign::TOP_END)
+                    .gap(34.0)
+                    .frame(
+                        egui::Frame::NONE
+                            .fill(Color32::from_rgb(0x17, 0x1a, 0x1f))
+                            .stroke(Stroke::new(1.0_f32, Color32::from_white_alpha(20)))
+                            .corner_radius(CornerRadius::same(12))
+                            .inner_margin(egui::Margin::same(14))
+                            .shadow(egui::epaint::Shadow {
+                                offset: [0, 8],
+                                blur: 24,
+                                spread: 0,
+                                color: Color32::from_black_alpha(120),
+                            }),
+                    );
+                if self.shot_path.is_some()
+                    && std::env::var_os("RUSTTUBE_SHOT_MENU").is_some()
+                {
+                    popup = popup.open(true);
+                }
+                let menu = popup.show(|ui| {
+                    ui.set_width(250.0);
+                    ui.spacing_mut().item_spacing = Vec2::new(5.0, 4.0);
+                    ui.spacing_mut().button_padding = Vec2::new(6.0, 4.0);
+                    ui.label(
+                        RichText::new("Playback settings")
+                            .font(t::semibold(14.0))
+                            .color(t::TEXT),
+                    );
+                    ui.add_space(2.0);
+
+                    let volume = self.player.volume();
+                    ui.label(
+                        RichText::new("VOLUME")
+                            .font(t::semibold(10.0))
+                            .color(t::DIM_2),
+                    );
+                    ui.horizontal(|ui| {
+                        let rail = (ui.available_width() - 42.0).max(80.0);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(rail, 24.0),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
+                                let (_, _, target) =
+                                    t::progress(ui, rail, volume as f32 / 130.0, 3.0, t::ACCENT);
+                                if let Some(target) = target {
+                                    self.set_volume((target * 130.0).round() as i32);
                                 }
-                            }
-                        });
-                        ui.separator();
-                        ui.label("Playback speed");
-                        let mut speed = self.player.speed;
-                        ui.horizontal_wrapped(|ui| {
-                            for (preset, label) in [(0.5, "0.5×"), (0.75, "0.75×"), (1.0, "1×"), (1.25, "1.25×"), (1.5, "1.5×"), (2.0, "2×")] {
-                                if ui.selectable_label((speed - preset).abs() < 0.001, label).clicked() {
-                                    speed = preset;
-                                }
-                            }
-                        });
-                        if ui
-                            .add(egui::Slider::new(&mut speed, 0.25..=4.0).suffix("×").fixed_decimals(2))
-                            .changed()
-                            || (speed - self.player.speed).abs() > 0.001
-                        {
-                            self.set_speed(speed);
-                        }
-                        if !full {
-                            ui.separator();
-                            if ui.checkbox(&mut self.wide_player, "Wide player").changed() {
-                                self.settings.wide_player = self.wide_player;
-                                let value = if self.wide_player { "1" } else { "0" };
-                                let _ = self.with_db(|conn| db::set_setting(conn, "wide_player", value));
+                            },
+                        );
+                        ui.label(
+                            RichText::new(format!("{volume}%"))
+                                .font(t::medium(11.5))
+                                .color(t::DIM),
+                        );
+                    });
+
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new("QUALITY")
+                            .font(t::semibold(10.0))
+                            .color(t::DIM_2),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
+                        for option in Quality::ALL {
+                            if t::choice_chip(
+                                ui,
+                                self.player.quality == option,
+                                option.label(),
+                            )
+                            .clicked()
+                            {
+                                self.set_quality(option);
                                 ui.close();
                             }
                         }
                     });
+
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new("SPEED")
+                            .font(t::semibold(10.0))
+                            .color(t::DIM_2),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
+                        for (preset, label) in [
+                            (0.5, "0.5×"),
+                            (0.75, "0.75×"),
+                            (1.0, "1×"),
+                            (1.25, "1.25×"),
+                            (1.5, "1.5×"),
+                            (2.0, "2×"),
+                        ] {
+                            if t::choice_chip(
+                                ui,
+                                (self.player.speed - preset).abs() < 0.001,
+                                label,
+                            )
+                            .clicked()
+                            {
+                                self.set_speed(preset);
+                            }
+                        }
+                    });
+                });
                 self.playback_menu_open = menu.is_some();
 
+                self.watch_bookmark(ui, card, true);
                 let muted = self.player.muted;
                 let (mute_icon, mute_hint) = if muted {
                     (t::Icon::VolumeMuted, "Unmute (M)")
                 } else {
                     (t::Icon::Volume, "Mute (M)")
                 };
-                if t::icon_button(ui, mute_icon, 32.0)
+                if t::player_icon_button(ui, mute_icon, 34.0)
                     .on_hover_text(mute_hint)
                     .clicked()
                 {
@@ -3725,6 +3901,82 @@ impl App {
         });
 
         Some(rect)
+    }
+
+    fn watch_bookmark(&mut self, ui: &mut Ui, card: &VideoCard, in_player: bool) {
+        let saved = self.with_db(|conn| db::is_saved(conn, &card.id)).unwrap_or(false);
+        let icon = if saved { t::Icon::BookmarkCheck } else { t::Icon::Bookmark };
+        let response = t::player_icon_button(ui, icon, 34.0)
+            .on_hover_text(if saved { "Saved · playlist actions" } else { "Save or add to playlist" });
+        self.bookmark_menu_open = egui::Popup::menu(&response)
+            .align(if in_player { egui::RectAlign::TOP_END } else { egui::RectAlign::BOTTOM_START })
+            .gap(if in_player { 34.0 } else { 6.0 })
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                if t::quiet_button(ui, if saved { "Remove from Saved" } else { "Save" }).clicked() {
+                    let saved = self.with_db(|conn| db::set_saved(
+                        conn, &card.id, &card.title, &card.channel_id, &card.channel_name,
+                        card.duration, !saved,
+                    ));
+                    match saved {
+                        Some(Ok(saved)) => {
+                            self.saved = Load::Idle;
+                            self.toast(if saved { "Saved" } else { "Removed from Saved" });
+                            ui.close();
+                        }
+                        _ => self.toast("Couldn’t update Saved"),
+                    }
+                }
+                if t::quiet_button(ui, if self.playlist_picker { "Hide playlists" } else { "Add to playlist" }).clicked() {
+                    self.playlist_picker = !self.playlist_picker;
+                }
+                if self.playlist_picker {
+                    ui.set_width(300.0);
+                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                        self.playlist_picker_panel(ui, card);
+                    });
+                }
+            }).is_some();
+        if !self.bookmark_menu_open {
+            self.playlist_picker = false;
+        }
+    }
+
+    fn watch_description(&mut self, ui: &mut Ui, id: &str, meta: &str) {
+        let mut retry = false;
+        t::panel_frame().inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            if !meta.is_empty() {
+                ui.label(RichText::new(meta).font(t::medium(11.5)).color(t::DIM));
+            }
+            match &self.description {
+                Load::Ready(text) if !text.is_empty() => {
+                    let expand = ui.id().with(("description-expanded", id));
+                    let expanded = ui.data(|data| data.get_temp::<bool>(expand)).unwrap_or(false);
+                    let mut job = egui::text::LayoutJob::simple(
+                        text.clone(), t::regular(13.0), t::TEXT, ui.available_width(),
+                    );
+                    job.wrap.max_rows = if expanded { usize::MAX } else { 2 };
+                    let galley = ui.fonts(|fonts| fonts.layout_job(job));
+                    let can_expand = galley.elided || expanded;
+                    ui.add(egui::Label::new(galley));
+                    if can_expand && ui.link(if expanded { "Show less" } else { "Show more" }).clicked() {
+                        ui.data_mut(|data| data.insert_temp(expand, !expanded));
+                    }
+                }
+                Load::Ready(_) => { ui.label(RichText::new("No description.").color(t::DIM)); }
+                Load::Failed(_) => {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Couldn’t load the description.").color(t::DIM));
+                        retry = ui.link("Retry").clicked();
+                    });
+                }
+                _ => { ui.label(RichText::new("Loading description…").color(t::DIM)); }
+            }
+        });
+        if retry {
+            self.request_detail(id);
+        }
     }
 
     fn view_watch(&mut self, ui: &mut Ui, id: String) {
@@ -3891,6 +4143,7 @@ impl App {
                     let hud_rect = if playing_this && !external {
                         self.video_hud(ui, &card, poster, snapshot)
                     } else {
+                        self.scrubbing = false;
                         None
                     };
                     let over_hud = hud_rect.is_some_and(|rect| {
@@ -3907,9 +4160,37 @@ impl App {
                     }
 
                     ui.add_space(14.0);
-                    ui.label(RichText::new(&card.title).size(19.0).strong());
-                    ui.add_space(4.0);
+                    ui.label(RichText::new(&card.title).font(t::bold(20.0)));
+                    ui.add_space(8.0);
 
+                    let bookmark_in_player = playing_this && !external && snapshot.started
+                        && Self::has_player_hud(poster);
+                    ui.horizontal_wrapped(|ui| {
+                        self.paint_avatar(ui, &card.channel_name, &card.channel_avatar, 34.0);
+                        let name = RichText::new(&card.channel_name).font(t::semibold(13.5));
+                        if !card.channel_id.is_empty() {
+                            if ui.link(name).on_hover_text("Open channel").clicked() {
+                                self.navigate(Route::Channel(card.channel_id.clone()));
+                            }
+                            let subscribed = self.with_db(|conn| db::is_subscribed(conn, &card.channel_id))
+                                .unwrap_or(false);
+                            if t::quiet_button(ui, if subscribed { "Subscribed" } else { "Subscribe" }).clicked() {
+                                self.toggle_subscription(&card.channel_id, &card.channel_name, &card.channel_avatar);
+                            }
+                        } else if !card.channel_name.is_empty() {
+                            ui.label(name);
+                        }
+                        if !bookmark_in_player {
+                            self.watch_bookmark(ui, &card, false);
+                        }
+                        if external && playing_this && t::quiet_button(ui, "Stop MPV").clicked() {
+                            self.flush_watch();
+                            self.player.stop();
+                            self.attempted = None;
+                        }
+                    });
+
+                    ui.add_space(12.0);
                     let mut meta = Vec::new();
                     if card.views > 0 {
                         meta.push(format!("{} views", t::format_compact(card.views)));
@@ -3922,158 +4203,8 @@ impl App {
                     if !card.published.is_empty() {
                         meta.push(card.published.clone());
                     }
-                    ui.label(RichText::new(meta.join(" · ")).size(12.5).color(t::DIM));
+                    self.watch_description(ui, &id, &meta.join(" · "));
 
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        self.paint_avatar(ui, &card.channel_name, &card.channel_avatar, 38.0);
-                        ui.vertical(|ui| {
-                            let name = ui
-                                .add(
-                                    egui::Label::new(
-                                        RichText::new(&card.channel_name).font(t::semibold(13.5)),
-                                    )
-                                    .truncate()
-                                    .sense(Sense::click()),
-                                )
-                                .on_hover_text("Open channel")
-                                .on_hover_cursor(egui::CursorIcon::PointingHand);
-                            if name.clicked() && !card.channel_id.is_empty() {
-                                self.navigate(Route::Channel(card.channel_id.clone()));
-                            }
-                            if !card.channel_id.is_empty() {
-                                ui.label(
-                                    RichText::new("Channel").size(11.0).color(t::DIM_2),
-                                );
-                            }
-                        });
-                        ui.add_space(6.0);
-                        let subscribed = self
-                            .with_db(|conn| db::is_subscribed(conn, &card.channel_id))
-                            .unwrap_or(false);
-                        let label = if subscribed { "Subscribed" } else { "Subscribe" };
-                        let button = if subscribed {
-                            t::quiet_button(ui, label)
-                        } else {
-                            t::accent_button(ui, label)
-                        };
-                        if button.clicked() {
-                            self.toggle_subscription(
-                                &card.channel_id,
-                                &card.channel_name,
-                                &card.channel_avatar,
-                            );
-                        }
-                        if !card.channel_id.is_empty() && t::quiet_button(ui, "Channel").clicked() {
-                            self.navigate(Route::Channel(card.channel_id.clone()));
-                        }
-                    });
-
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        let saved = self
-                            .with_db(|conn| db::is_saved(conn, &card.id))
-                            .unwrap_or(false);
-                        if t::quiet_button(ui, if saved { "Saved" } else { "Save" }).clicked() {
-                            let _ = self.with_db(|conn| {
-                                db::set_saved(
-                                    conn,
-                                    &card.id,
-                                    &card.title,
-                                    &card.channel_id,
-                                    &card.channel_name,
-                                    card.duration,
-                                    !saved,
-                                )
-                            });
-                            self.saved = Load::Idle;
-                            self.toast(if saved {
-                                "Removed from Saved"
-                            } else {
-                                "Saved"
-                            });
-                        }
-                        if t::quiet_button(ui, "Add to playlist").clicked() {
-                            self.playlist_picker = !self.playlist_picker;
-                        }
-                    });
-                    if self.playlist_picker {
-                        self.playlist_picker_panel(ui, &card);
-                    }
-
-                    ui.add_space(10.0);
-                    if external {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(if playing_this {
-                                    "Playing in a separate MPV window"
-                                } else {
-                                    "Press the poster to play in MPV"
-                                })
-                                .size(11.5)
-                                .color(t::DIM_2),
-                            );
-                            if playing_this && t::quiet_button(ui, "Stop playback").clicked() {
-                                self.flush_watch();
-                                self.player.stop();
-                                self.attempted = None;
-                            }
-                        });
-                    } else {
-                        ui.label(
-                            RichText::new(if playing_this {
-                                if !snapshot.started {
-                                    "Starting player…"
-                                } else if snapshot.paused {
-                                    "Paused — click the video to resume"
-                                } else {
-                                    "Playing in RustTube"
-                                }
-                            } else {
-                                "Press the poster to play"
-                            })
-                            .size(11.5)
-                            .color(t::DIM_2),
-                        );
-                    }
-
-                    ui.add_space(12.0);
-                    let description = detail
-                        .as_ref()
-                        .map(|d| d.description.trim().to_string())
-                        .unwrap_or_default();
-                    t::panel_frame().show(ui, |ui| {
-                        if !description.is_empty() {
-                            egui::ScrollArea::vertical()
-                                .id_salt("description")
-                                .max_height(150.0)
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        RichText::new(description)
-                                            .size(12.8)
-                                            .color(Color32::from_rgb(0xc6, 0xc6, 0xd0)),
-                                    );
-                                });
-                        } else {
-                            ui.horizontal(|ui| {
-                                let message = match &self.detail {
-                                    Load::Failed(err) => {
-                                        format!("Description unavailable: {err}")
-                                    }
-                                    Load::Loading => "Loading description…".to_string(),
-                                    _ => "No description available.".to_string(),
-                                };
-                                ui.label(RichText::new(message).size(12.2).color(t::DIM_2));
-                                if matches!(self.detail, Load::Failed(_))
-                                    && t::quiet_button(ui, "Retry").clicked()
-                                {
-                                    self.detail = Load::Idle;
-                                    self.detail_id.clear();
-                                    self.ensure_loaded();
-                                }
-                            });
-                        }
-                    });
                 },
             );
 
@@ -6098,7 +6229,11 @@ impl eframe::App for App {
         }
         self.draw_opening(ctx);
         self.draw_closing(ctx);
-        if self.fullscreen && self.last_pointer_move.elapsed() > Duration::from_millis(1500) {
+        if self.scrubbing {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        } else if self.fullscreen && !self.bookmark_menu_open && !self.playback_menu_open
+            && self.last_pointer_move.elapsed() > Duration::from_millis(1500)
+        {
             ctx.set_cursor_icon(egui::CursorIcon::None);
         }
         self.sync_hover_preview();

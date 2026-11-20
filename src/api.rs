@@ -1,10 +1,7 @@
 //! YouTube metadata access.
 //!
-//! RustTube never talks to youtube.com directly for metadata. Instead it speaks
-//! the two common front-end APIs (Invidious and Piped) and transparently falls
-//! back between a list of instances. Every call tries the last instance that
-//! worked first, then the rest in order, so a single dead instance only costs
-//! one timeout.
+//! Invidious and Piped are the primary metadata sources. The watch page can
+//! fall back to public video metadata from the bundled yt-dlp.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -672,6 +669,38 @@ fn strip_html(raw: &str) -> String {
         }
     }
     out.trim().to_string()
+}
+
+/// yt-dlp descriptions are plain text (keep literal angle brackets and ampersands).
+pub fn ytdlp_detail(value: &Value, id: &str) -> Result<VideoDetail, String> {
+    let description = value.get("description").and_then(Value::as_str);
+    let title = s(value, "title");
+    if value.get("id").and_then(Value::as_str) != Some(id) || title.trim().is_empty() {
+        return Err("Invalid video metadata".into());
+    }
+    let description = description.ok_or("The source did not return a description field")?;
+    let published_unix = chrono::NaiveDate::parse_from_str(&s(value, "upload_date"), "%Y%m%d")
+        .ok()
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .map_or(0, |date| date.and_utc().timestamp());
+    Ok(VideoDetail {
+        card: VideoCard {
+            id: id.to_string(),
+            title,
+            channel_name: s(value, "channel"),
+            channel_id: s(value, "channel_id"),
+            channel_avatar: String::new(),
+            duration: value.get("duration").and_then(Value::as_f64).unwrap_or(0.0).max(0.0) as i64,
+            views: value.get("view_count").and_then(Value::as_u64).unwrap_or(0),
+            published: relative_date(published_unix),
+            published_unix,
+            thumbnail: thumb(id, "mq"),
+            live: false,
+        },
+        description: description.trim().to_string(),
+        likes: 0,
+        related: Vec::new(),
+    })
 }
 
 fn relative_date(unix: i64) -> String {

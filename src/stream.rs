@@ -396,7 +396,7 @@ fn ytdlp() -> std::path::PathBuf {
     std::path::PathBuf::from("yt-dlp")
 }
 
-fn run_ytdlp(args: &[&str], url: &str) -> Result<Vec<u8>, String> {
+fn ytdlp_command(args: &[&str], url: &str) -> Command {
     let mut command = Command::new(ytdlp());
     command
         .args(args)
@@ -414,7 +414,65 @@ fn run_ytdlp(args: &[&str], url: &str) -> Result<Vec<u8>, String> {
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let output = command.output().map_err(|err| match err.kind() {
+    command
+}
+
+/// Fetch only public metadata, with no downloads or user yt-dlp configuration.
+pub async fn video_metadata(id: &str) -> Result<serde_json::Value, String> {
+    if id.len() != 11 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err("Invalid video ID".into());
+    }
+    let url = watch_url(id);
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+
+        let mut child = ytdlp_command(
+            &[
+                "--ignore-config", "--no-playlist", "--skip-download", "--no-warnings",
+                "--socket-timeout", "5", "--retries", "0", "--extractor-retries", "0",
+                "--print", "%(.{id,title,channel,channel_id,duration,view_count,upload_date,description})j",
+            ],
+            &url,
+        )
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| format!("Could not start yt-dlp: {err}"))?;
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let stdout = child.stdout.take().expect("yt-dlp stdout is piped");
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.take(256 * 1024).read_to_end(&mut bytes).map(|_| bytes)
+        });
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => break,
+                Ok(Some(_)) => return Err("yt-dlp could not load video metadata".into()),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("yt-dlp metadata request timed out or was interrupted".into());
+                }
+            }
+        }
+        while !reader.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if !reader.is_finished() {
+            return Err("yt-dlp metadata output timed out".into());
+        }
+        let bytes = reader.join().map_err(|_| "Could not read yt-dlp output")?
+            .map_err(|_| "Could not read yt-dlp output")?;
+        serde_json::from_slice(&bytes).map_err(|_| "Invalid yt-dlp metadata".into())
+    })
+    .await
+    .map_err(|_| "Metadata task was interrupted")?
+}
+
+fn run_ytdlp(args: &[&str], url: &str) -> Result<Vec<u8>, String> {
+    let output = ytdlp_command(args, url).output().map_err(|err| match err.kind() {
         std::io::ErrorKind::NotFound => "yt-dlp is not installed. Install it with \
                 `brew install yt-dlp` (macOS) or `winget install yt-dlp` (Windows)."
             .to_string(),

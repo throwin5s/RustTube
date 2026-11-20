@@ -42,6 +42,7 @@ jobs:
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
           cp target/release/rusttube "$APP/Contents/MacOS/RustTube"
           cp icons/icon.icns "$APP/Contents/Resources/AppIcon.icns"
+          cp assets/lucide/LICENSE "$APP/Contents/Resources/Lucide-LICENSE.txt"
           curl -L --fail --retry 3 \
             https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos \
             -o "$APP/Contents/MacOS/yt-dlp"
@@ -171,6 +172,7 @@ jobs:
           New-Item -ItemType Directory -Force $out | Out-Null
           Copy-Item "target\x86_64-pc-windows-gnu\release\rusttube.exe" "$out\RustTube.exe"
           Copy-Item $env:LIBMPV_DLL "$out\libmpv-2.dll"
+          Copy-Item "assets\lucide\LICENSE" "$out\Lucide-LICENSE.txt"
           curl.exe -L --fail --retry 3 `
             "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" `
             -o "$out\yt-dlp.exe"
