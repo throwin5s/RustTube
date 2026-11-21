@@ -238,6 +238,15 @@ fn provider(key: &str) -> Option<&'static Provider> {
     PROVIDERS.iter().find(|provider| provider.key == key)
 }
 
+/// Every client the picker offers, installed or not, in display order, so a
+/// missing desktop app reads as "not installed" instead of "unsupported".
+pub fn supported_clouds() -> Vec<(&'static str, &'static str)> {
+    PROVIDERS
+        .iter()
+        .map(|provider| (provider.key, provider.label))
+        .collect()
+}
+
 pub fn cloud_label(key: &str) -> &'static str {
     provider(key).map_or("a cloud folder", |found| found.label)
 }
@@ -712,6 +721,15 @@ mod tests {
         assert_eq!(cloud_label("mega"), "MEGA");
         assert_eq!(cloud_label("tresorit"), "Tresorit");
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn the_picker_offers_every_supported_client() {
+        let all = supported_clouds();
+        assert_eq!(all.len(), PROVIDERS.len());
+        assert_eq!(all.first().map(|(key, _)| *key), Some("gdrive"));
+        assert!(all.iter().any(|(key, _)| *key == "proton"));
+        assert!(all.iter().any(|(key, _)| *key == "koofr"));
     }
 
     #[test]

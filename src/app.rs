@@ -5362,66 +5362,70 @@ impl App {
                     ui.add_space(10.0);
 
                     if self.settings.sync_mode == "cloud" {
+                        // List every client RustTube knows. The ones whose
+                        // desktop app is not signed in on this machine stay
+                        // visibly disabled, so they read as "not installed"
+                        // rather than as a build that lacks them.
                         let clouds = sync::detect_clouds();
-                        if clouds.is_empty() {
-                            ui.label(
-                                RichText::new(
-                                    "No cloud client found. Install and sign in to Google Drive, OneDrive, iCloud Drive, Dropbox, Box, Proton Drive, Nextcloud, MEGA or another supported client, then reopen this page.",
-                                )
-                                .size(11.8)
-                                .color(t::DIM_2),
-                            );
-                        } else {
-                            ui.label(
-                                RichText::new(
-                                    "Sign in to the same account on every device; RustTube keeps its file inside a RustTube folder there.",
-                                )
-                                .size(11.8)
-                                .color(t::DIM_2),
-                            );
-                            ui.add_space(8.0);
-                            let mut chosen: Option<String> = None;
-                            ui.horizontal_wrapped(|ui| {
-                                for cloud in &clouds {
-                                    let active = self.settings.sync_cloud == cloud.key;
-                                    let button = ui.add(
-                                        egui::Button::new(
-                                            RichText::new(cloud.label).size(11.5).color(if active {
-                                                t::TEXT
-                                            } else {
-                                                t::DIM
-                                            }),
-                                        )
-                                        .fill(if active { t::PANEL_2 } else { Color32::TRANSPARENT })
-                                        .stroke(Stroke::new(
-                                            1.0_f32,
-                                            if active { t::ACCENT } else { t::LINE },
-                                        ))
-                                        .corner_radius(CornerRadius::same(t::RADIUS)),
-                                    );
-                                    if button
-                                        .on_hover_text(cloud.path.display().to_string())
-                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                        .clicked()
-                                    {
-                                        chosen = Some(cloud.key.to_string());
-                                    }
-                                }
-                            });
-                            if let Some(key) = chosen {
-                                self.settings.sync_cloud = key;
-                                self.settings.sync_auto = true;
-                                self.save_settings();
-                                self.sync_now();
-                            }
-                            if let Some(path) = sync::cloud_folder(&self.settings.sync_cloud) {
-                                ui.add_space(6.0);
-                                ui.label(
-                                    RichText::new(path.display().to_string())
-                                        .size(11.0)
-                                        .color(t::DIM_2),
+                        ui.label(
+                            RichText::new(
+                                "RustTube writes into the folder a signed-in desktop client already syncs, so only installed clients can be picked here. Folder and WebDAV below work with anything else.",
+                            )
+                            .size(11.8)
+                            .color(t::DIM_2),
+                        );
+                        ui.add_space(8.0);
+                        let mut chosen: Option<String> = None;
+                        ui.horizontal_wrapped(|ui| {
+                            for (key, label) in sync::supported_clouds() {
+                                let mount = clouds.iter().find(|cloud| cloud.key == key);
+                                let active = self.settings.sync_cloud == key;
+                                let button = ui.add_enabled(
+                                    mount.is_some(),
+                                    egui::Button::new(
+                                        RichText::new(label).size(11.5).color(if active {
+                                            t::TEXT
+                                        } else if mount.is_some() {
+                                            t::DIM
+                                        } else {
+                                            t::DIM_2
+                                        }),
+                                    )
+                                    .fill(if active { t::PANEL_2 } else { Color32::TRANSPARENT })
+                                    .stroke(Stroke::new(
+                                        1.0_f32,
+                                        if active { t::ACCENT } else { t::LINE },
+                                    ))
+                                    .corner_radius(CornerRadius::same(t::RADIUS)),
                                 );
+                                let hint = match mount {
+                                    Some(cloud) => cloud.path.display().to_string(),
+                                    None => format!(
+                                        "Install {label} and sign in to its desktop app, then reopen this page."
+                                    ),
+                                };
+                                if button
+                                    .on_hover_text(hint)
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .clicked()
+                                {
+                                    chosen = Some(key.to_string());
+                                }
                             }
+                        });
+                        if let Some(key) = chosen {
+                            self.settings.sync_cloud = key;
+                            self.settings.sync_auto = true;
+                            self.save_settings();
+                            self.sync_now();
+                        }
+                        if let Some(path) = sync::cloud_folder(&self.settings.sync_cloud) {
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new(path.display().to_string())
+                                    .size(11.0)
+                                    .color(t::DIM_2),
+                            );
                         }
                     }
 
