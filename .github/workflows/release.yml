@@ -47,6 +47,15 @@ jobs:
             https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos \
             -o "$APP/Contents/MacOS/yt-dlp"
           chmod +x "$APP/Contents/MacOS/yt-dlp"
+          curl -L --fail --retry 3 \
+            https://github.com/rclone/rclone/releases/download/v1.76.0/rclone-v1.76.0-osx-arm64.zip \
+            -o rclone.zip
+          ditto -x -k rclone.zip rclone-unpack
+          cp rclone-unpack/rclone-v1.76.0-osx-arm64/rclone "$APP/Contents/MacOS/rclone"
+          chmod +x "$APP/Contents/MacOS/rclone"
+          curl -L --fail --retry 3 \
+            https://raw.githubusercontent.com/rclone/rclone/v1.76.0/COPYING \
+            -o "$APP/Contents/Resources/Rclone-LICENCE.txt"
           cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -77,7 +86,7 @@ jobs:
           prev=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)
           range="${prev:+$prev..}$TAG"
           {
-            echo 'Native macOS and Windows builds of RustTube, with libmpv and yt-dlp bundled.'
+            echo 'Native macOS and Windows builds of RustTube, with libmpv, yt-dlp and rclone bundled.'
             echo
             echo '- **macOS (Apple silicon):** unzip and move `RustTube.app` to Applications. The build is unsigned, so the first launch needs right-click → Open (or `xattr -dr com.apple.quarantine RustTube.app`).'
             echo '- **Windows (x64):** unzip the folder and run `RustTube.exe`. The build is unsigned, so SmartScreen may ask for More info → Run anyway.'
@@ -176,6 +185,14 @@ jobs:
           curl.exe -L --fail --retry 3 `
             "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" `
             -o "$out\yt-dlp.exe"
+          curl.exe -L --fail --retry 3 `
+            "https://github.com/rclone/rclone/releases/download/v1.76.0/rclone-v1.76.0-windows-amd64.zip" `
+            -o rclone.zip
+          Expand-Archive -Path rclone.zip -DestinationPath rclone-unpack -Force
+          Copy-Item "rclone-unpack\rclone-v1.76.0-windows-amd64\rclone.exe" "$out\rclone.exe"
+          curl.exe -L --fail --retry 3 `
+            "https://raw.githubusercontent.com/rclone/rclone/v1.76.0/COPYING" `
+            -o "$out\Rclone-LICENCE.txt"
           # Rust's GNU target normally links these statically, but the C parts
           # (SQLite) can pull them in; ship them when present so the zip runs
           # on a clean Windows install.
@@ -188,7 +205,7 @@ jobs:
           RustTube $env:TAG
           ================
 
-          1. Keep RustTube.exe, libmpv-2.dll and yt-dlp.exe in the same folder.
+          1. Keep RustTube.exe, libmpv-2.dll, yt-dlp.exe and rclone.exe in the same folder.
           2. Run RustTube.exe.
           3. If SmartScreen appears: More info -> Run anyway.
 
@@ -202,7 +219,7 @@ jobs:
       - name: Compose release notes
         run: |
           $notes = @(
-            'Native macOS and Windows builds of RustTube, with libmpv and yt-dlp bundled.',
+            'Native macOS and Windows builds of RustTube, with libmpv, yt-dlp and rclone bundled.',
             '',
             '- **macOS (Apple silicon):** unzip and move `RustTube.app` to Applications. The build is unsigned, so the first launch needs right-click → Open (or `xattr -dr com.apple.quarantine RustTube.app`).',
             '- **Windows (x64):** unzip the folder and run `RustTube.exe`. The build is unsigned, so SmartScreen may ask for More info → Run anyway.',

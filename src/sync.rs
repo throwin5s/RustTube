@@ -2,9 +2,9 @@
 //!
 //! RustTube stores one JSON snapshot in the storage you already have: the folder
 //! a cloud client (Google Drive, OneDrive, iCloud Drive, Dropbox, Box, Proton
-//! Drive, Nextcloud, MEGA and more) keeps in sync, any other synced folder, or
-//! a WebDAV server. There is no
-//! RustTube account and no server of ours in the middle.
+//! Drive, Nextcloud, MEGA and more) keeps in sync, any other synced folder, a
+//! WebDAV server, or an rclone remote (MEGA and anything else rclone speaks).
+//! There is no RustTube account and no server of ours in the middle.
 //!
 //! Cloud mode stores the *provider*, not a path, so the same setup means the
 //! same place on macOS and Windows: whichever folder that client mounts, the
@@ -27,11 +27,13 @@ const CLOUD_SUBFOLDER: &str = "RustTube";
 
 #[derive(Clone, Debug, Default)]
 pub struct SyncSettings {
-    /// "off" | "cloud" | "folder" | "webdav"
+    /// "off" | "cloud" | "folder" | "rclone" | "webdav"
     pub mode: String,
     /// Provider key for cloud mode, e.g. "gdrive". Portable across platforms.
     pub cloud: String,
     pub folder: String,
+    /// Remote path for the rclone transport, e.g. `mega:RustTube`.
+    pub rclone: String,
     pub webdav_url: String,
     pub webdav_user: String,
     pub webdav_pass: String,
@@ -55,6 +57,7 @@ pub struct SyncInfo {
     pub mode: String,
     pub cloud: String,
     pub folder: String,
+    pub rclone: String,
     pub webdav_url: String,
     pub webdav_user: String,
     pub has_password: bool,
@@ -80,6 +83,7 @@ impl SyncSettings {
             mode: if mode.is_empty() { "off".into() } else { mode },
             cloud: get("sync_cloud"),
             folder: get("sync_folder"),
+            rclone: get("sync_rclone"),
             webdav_url: get("sync_webdav_url"),
             webdav_user: get("sync_webdav_user"),
             webdav_pass: get("sync_webdav_pass"),
@@ -91,6 +95,7 @@ impl SyncSettings {
         db::set_setting(conn, "sync_mode", &self.mode)?;
         db::set_setting(conn, "sync_cloud", &self.cloud)?;
         db::set_setting(conn, "sync_folder", &self.folder)?;
+        db::set_setting(conn, "sync_rclone", &self.rclone)?;
         db::set_setting(conn, "sync_webdav_url", &self.webdav_url)?;
         db::set_setting(conn, "sync_webdav_user", &self.webdav_user)?;
         db::set_setting(conn, "sync_webdav_pass", &self.webdav_pass)?;
@@ -102,6 +107,7 @@ impl SyncSettings {
         match self.mode.as_str() {
             "cloud" => cloud_folder(&self.cloud).is_some(),
             "folder" => !self.folder.trim().is_empty(),
+            "rclone" => !self.rclone.trim().is_empty(),
             "webdav" => !self.webdav_url.trim().is_empty(),
             _ => false,
         }
@@ -113,6 +119,7 @@ impl SyncSettings {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| format!("{} (desktop app not found)", cloud_label(&self.cloud))),
             "folder" => expand_path(&self.folder).map(|p| p.display().to_string()).unwrap_or_default(),
+            "rclone" => self.rclone.trim().to_string(),
             "webdav" => self.webdav_url.trim().to_string(),
             _ => String::new(),
         }
@@ -123,6 +130,7 @@ impl SyncSettings {
             mode: self.mode.clone(),
             cloud: self.cloud.clone(),
             folder: self.folder.clone(),
+            rclone: self.rclone.clone(),
             webdav_url: self.webdav_url.clone(),
             webdav_user: self.webdav_user.clone(),
             has_password: !self.webdav_pass.is_empty(),
@@ -434,6 +442,7 @@ async fn pull(settings: &SyncSettings, http: &Client) -> Result<Option<String>, 
                 other => Err(format!("WebDAV server answered HTTP {other}")),
             }
         }
+        "rclone" => rclone_pull(&settings.rclone).await,
         _ => Err("Sync is turned off.".into()),
     }
 }
@@ -486,7 +495,139 @@ async fn push(settings: &SyncSettings, http: &Client, body: &str) -> Result<(), 
             }
             Err(format!("WebDAV refused the upload (HTTP {status})"))
         }
+        "rclone" => rclone_push(&settings.rclone, body).await,
         _ => Err("Sync is turned off.".into()),
+    }
+}
+
+/// The remote file RustTube keeps, e.g. `mega:RustTube/rusttube-sync.json`.
+fn rclone_file(target: &str) -> Result<String, String> {
+    let target = target.trim().trim_end_matches('/');
+    if target.is_empty() {
+        return Err("Set the rclone remote first, for example mega:RustTube".into());
+    }
+    if !target.contains(':') {
+        return Err("The rclone path needs a remote name, for example mega:RustTube".into());
+    }
+    Ok(format!("{target}/{SNAPSHOT_NAME}"))
+}
+
+/// The rclone shipped inside the macOS bundle and the Windows package, falling
+/// back to PATH for development builds. rclone keeps its own remote config, so
+/// RustTube never stores a MEGA password.
+pub fn rclone_binary() -> PathBuf {
+    let name = if cfg!(windows) { "rclone.exe" } else { "rclone" };
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from(name)
+}
+
+/// Whether the binary can actually run, for the Settings card. The caller asks
+/// once when the page opens instead of on every frame.
+pub fn rclone_works() -> bool {
+    rclone_command()
+        .arg("version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn rclone_command() -> std::process::Command {
+    let mut command = std::process::Command::new(rclone_binary());
+    command.stdin(std::process::Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Without CREATE_NO_WINDOW, every sync would flash a console over the app.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    command
+}
+
+async fn rclone_pull(target: &str) -> Result<Option<String>, String> {
+    let target = target.to_string();
+    tokio::task::spawn_blocking(move || rclone_pull_blocking(&target))
+        .await
+        .map_err(|err| format!("rclone task failed: {err}"))?
+}
+
+fn rclone_pull_blocking(target: &str) -> Result<Option<String>, String> {
+    let file = rclone_file(target)?;
+    let output = rclone_command()
+        .args(["--quiet", "--timeout", "60s"])
+        .arg("cat")
+        .arg(&file)
+        .output()
+        .map_err(|err| format!("Could not start rclone ({}): {err}", rclone_binary().display()))?;
+
+    match output.status.code() {
+        Some(0) => Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned())),
+        // rclone's 3 and 4 mean "directory/file not found": the first device
+        // has not uploaded anything yet, which is not an error.
+        Some(3) | Some(4) => Ok(None),
+        _ => Err(rclone_error(&output)),
+    }
+}
+
+async fn rclone_push(target: &str, body: &str) -> Result<(), String> {
+    let target = target.to_string();
+    let body = body.to_string();
+    tokio::task::spawn_blocking(move || rclone_push_blocking(&target, &body))
+        .await
+        .map_err(|err| format!("rclone task failed: {err}"))?
+}
+
+fn rclone_push_blocking(target: &str, body: &str) -> Result<(), String> {
+    let file = rclone_file(target)?;
+    let dir = target.trim().trim_end_matches('/').to_string();
+    // mkdir is idempotent and makes the first push work on an empty remote.
+    let _ = rclone_command().arg("mkdir").arg(&dir).output();
+
+    // Upload from a file rather than stdin so rclone can retry by itself.
+    let tmp = std::env::temp_dir().join(format!("rusttube-sync-{}.json", uuid::Uuid::new_v4()));
+    std::fs::write(&tmp, body).map_err(|e| format!("Could not write {}: {e}", tmp.display()))?;
+    let output = rclone_command()
+        .args(["--quiet", "--retries", "1", "--contimeout", "15s", "--timeout", "60s"])
+        .arg("copyto")
+        .arg(&tmp)
+        .arg(&file)
+        .output();
+    let _ = std::fs::remove_file(&tmp);
+
+    let output = output.map_err(|err| {
+        format!("Could not start rclone ({}): {err}", rclone_binary().display())
+    })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(rclone_error(&output))
+    }
+}
+
+/// rclone's last stderr line names the real problem (unknown remote, rejected
+/// password, a 2FA prompt that needed a terminal), so surface it verbatim.
+fn rclone_error(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let line = stderr
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .trim();
+    if line.is_empty() {
+        format!("rclone exited with {:?}", output.status.code())
+    } else {
+        format!("rclone: {line}")
     }
 }
 
@@ -785,6 +926,53 @@ mod tests {
         assert_eq!(settings.enabled(), cloud_folder("gdrive").is_some());
         assert_eq!(cloud_label("gdrive"), "Google Drive");
         assert_eq!(cloud_label("unknown"), "a cloud folder");
+    }
+
+    #[test]
+    fn builds_rclone_targets() {
+        assert_eq!(
+            rclone_file("mega:RustTube/").unwrap(),
+            "mega:RustTube/rusttube-sync.json"
+        );
+        assert!(rclone_file("  ").is_err());
+        assert!(rclone_file("RustTube").is_err(), "a remote name is required");
+    }
+
+    #[test]
+    fn rclone_mode_needs_a_remote() {
+        let mut settings = SyncSettings { mode: "rclone".into(), ..Default::default() };
+        assert!(!settings.enabled());
+        settings.rclone = "mega:RustTube".into();
+        assert!(settings.enabled());
+        assert_eq!(settings.target(), "mega:RustTube");
+    }
+
+    #[tokio::test]
+    #[ignore = "runs the rclone binary; uses a local backend and needs no account"]
+    async fn rclone_round_trip_through_a_local_remote() {
+        if !rclone_works() {
+            eprintln!("rclone is not installed; skipping");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("rusttube-rclone-{}", uuid::Uuid::new_v4()));
+        let target = format!(":local:{}", dir.join("remote").display());
+
+        assert_eq!(rclone_pull(&target).await.expect("empty pull"), None);
+
+        rclone_push(&target, "{\"one\":1}").await.expect("first push");
+        assert!(dir.join("remote").join(SNAPSHOT_NAME).exists());
+        assert_eq!(
+            rclone_pull(&target).await.expect("pull").as_deref(),
+            Some("{\"one\":1}")
+        );
+
+        rclone_push(&target, "{\"one\":2}").await.expect("second push");
+        assert_eq!(
+            rclone_pull(&target).await.expect("pull").as_deref(),
+            Some("{\"one\":2}")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

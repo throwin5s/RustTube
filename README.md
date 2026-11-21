@@ -223,6 +223,12 @@ every five minutes after that, always pull → merge → push.
 Folder mode still works for a network share or anything else that syncs, and
 WebDAV covers Nextcloud/ownCloud-style servers.
 
+**MEGA without a desktop client** uses rclone: pick **rclone**, enter a remote
+path such as `mega:RustTube`, and run the bundled wizard once per machine
+(`rclone config` → new remote → name it `mega` → choose MEGA → email, password
+and 2FA code). RustTube drives the rclone that ships inside the app, so there is
+no separate install and RustTube never stores your MEGA password.
+
 ### Merge rules
 
 - **Subscriptions and history**: per-record last-write-wins on `updated_at`
@@ -239,7 +245,8 @@ WebDAV covers Nextcloud/ownCloud-style servers.
 
 The WebDAV password is stored locally in the app database, never in the synced
 snapshot. Use provider app passwords; a future version should move this to the
-OS keychain.
+OS keychain. rclone keeps its own credentials in `rclone.conf`, outside
+RustTube — the app only stores the remote path.
 
 ## Layout
 

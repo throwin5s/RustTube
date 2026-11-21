@@ -135,11 +135,14 @@ struct SettingsDraft {
     sync_mode: String,
     sync_cloud: String,
     sync_folder: String,
+    sync_rclone: String,
     webdav_url: String,
     webdav_user: String,
     webdav_pass: String,
     has_password: bool,
     sync_auto: bool,
+    /// Whether the rclone binary answered when this page opened.
+    rclone_ok: bool,
     auto_update: bool,
     sidebar_hover: bool,
     watch_zoom: bool,
@@ -1478,11 +1481,13 @@ impl App {
                 sync_mode: sync.mode,
                 sync_cloud: sync.cloud,
                 sync_folder: sync.folder,
+                sync_rclone: sync.rclone,
                 webdav_url: sync.webdav_url,
                 webdav_user: sync.webdav_user,
                 webdav_pass: String::new(),
                 has_password: sync.has_password,
                 sync_auto: sync.auto,
+                rclone_ok: sync::rclone_works(),
             }
         }) else {
             return;
@@ -1551,11 +1556,12 @@ impl App {
             );
             let mut sync = SyncSettings::load(conn);
             sync.mode = match draft.sync_mode.as_str() {
-                "cloud" | "folder" | "webdav" => draft.sync_mode.clone(),
+                "cloud" | "folder" | "rclone" | "webdav" => draft.sync_mode.clone(),
                 _ => "off".to_string(),
             };
             sync.cloud = draft.sync_cloud.clone();
             sync.folder = draft.sync_folder.trim().to_string();
+            sync.rclone = draft.sync_rclone.trim().to_string();
             sync.webdav_url = draft.webdav_url.trim().to_string();
             sync.webdav_user = draft.webdav_user.clone();
             if !draft.webdav_pass.is_empty() {
@@ -1707,8 +1713,9 @@ impl App {
                     sync::cloud_label(&settings.cloud)
                 ),
                 "folder" => "Set a sync folder first".to_string(),
+                "rclone" => "Set the rclone remote first, for example mega:RustTube".to_string(),
                 "webdav" => "Set a WebDAV address first".to_string(),
-                _ => "Pick a cloud account, a folder or WebDAV first".to_string(),
+                _ => "Pick a cloud account, a folder, rclone or WebDAV first".to_string(),
             };
             self.toast(message);
             return;
@@ -1726,6 +1733,43 @@ impl App {
             let _ = tx.send(Msg::Sync(result));
             ctx.request_repaint();
         });
+    }
+
+    /// Open the bundled rclone's setup wizard in a terminal. It asks for an
+    /// email, password and 2FA code, so it cannot run inside the app.
+    fn open_rclone_setup(&mut self) {
+        let binary = sync::rclone_binary();
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+            match std::process::Command::new(&binary)
+                .arg("config")
+                .creation_flags(CREATE_NEW_CONSOLE)
+                .spawn()
+            {
+                Ok(_) => self.toast("Finish the rclone wizard in the new window".to_string()),
+                Err(err) => self.toast(format!("Could not start rclone: {err}")),
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            let path = binary
+                .display()
+                .to_string()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"");
+            let script = format!("tell application \"Terminal\" to do script \"\\\"{path}\\\" config\"");
+            match std::process::Command::new("osascript")
+                .args(["-e", &script])
+                .status()
+            {
+                Ok(_) => self.toast("Finish the rclone wizard in Terminal".to_string()),
+                Err(err) => self.toast(format!("Could not open Terminal: {err}")),
+            }
+        }
     }
 
     // ---------------------------------------------------------------- playback
@@ -5350,6 +5394,7 @@ impl App {
                             ("off", "Off"),
                             ("cloud", "Cloud account"),
                             ("folder", "Folder"),
+                            ("rclone", "rclone"),
                             ("webdav", "WebDAV"),
                         ] {
                             ui.selectable_value(
@@ -5500,6 +5545,39 @@ impl App {
                                 .size(11.0)
                                 .color(t::DIM_2),
                         );
+                    }
+
+                    if self.settings.sync_mode == "rclone" {
+                        ui.label(RichText::new("rclone remote").size(12.0).color(t::DIM));
+                        let width = ui.available_width();
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.sync_rclone)
+                                .hint_text("mega:RustTube")
+                                .desired_width(width),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "One-time setup per machine: run the wizard, choose a new remote, name it mega, pick MEGA, then enter your email, password and 2FA code. RustTube writes rusttube-sync.json into that remote.",
+                            )
+                            .size(11.0)
+                            .color(t::DIM_2),
+                        );
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if t::quiet_button(ui, "Set up in Terminal").clicked() {
+                                self.open_rclone_setup();
+                            }
+                            let binary = sync::rclone_binary();
+                            ui.label(
+                                RichText::new(if self.settings.rclone_ok {
+                                    format!("rclone found at {}", binary.display())
+                                } else {
+                                    format!("rclone not found at {}", binary.display())
+                                })
+                                .size(11.0)
+                                .color(if self.settings.rclone_ok { t::DIM_2 } else { t::DANGER }),
+                            );
+                        });
                     }
 
                     ui.add_space(8.0);

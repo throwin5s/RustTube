@@ -2763,7 +2763,7 @@ dependencies = [
 
 [[package]]
 name = "rusttube"
-version = "0.3.10"
+version = "0.3.11"
 dependencies = [
  "chrono",
  "eframe",
