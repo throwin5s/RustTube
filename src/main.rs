@@ -14,18 +14,25 @@ use app::App;
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
+    // Draw the app into the titlebar area: the top bar becomes the window
+    // chrome. The macOS traffic lights start hidden and are revealed when the
+    // pointer comes near them; on Windows the OS cannot hide just the caption
+    // buttons, so the frame is dropped and the bar draws its own.
+    let viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1200.0, 740.0])
+        .with_min_inner_size([900.0, 560.0])
+        .with_title("RustTube")
+        .with_app_id("rusttube")
+        .with_fullsize_content_view(true)
+        .with_titlebar_shown(false)
+        .with_title_shown(false)
+        .with_titlebar_buttons_shown(false)
+        .with_icon(window_icon());
+    #[cfg(target_os = "windows")]
+    let viewport = viewport.with_decorations(false);
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 740.0])
-            .with_min_inner_size([900.0, 560.0])
-            .with_title("RustTube")
-            .with_app_id("rusttube")
-            // Draw the app into the titlebar area; the native traffic lights
-            // stay in place and the top bar becomes part of the window.
-            .with_fullsize_content_view(true)
-            .with_titlebar_shown(false)
-            .with_title_shown(false)
-            .with_icon(window_icon()),
+        viewport,
         ..Default::default()
     };
 

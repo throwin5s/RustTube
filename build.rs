@@ -4,6 +4,21 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=LIBMPV_DIR");
 
+    // The macOS build can ask AppKit for the real SF Symbols at runtime. The
+    // helper is deliberately absent from Windows, where Apple does not license
+    // the symbols.
+    println!("cargo:rerun-if-changed=src/sf_symbols.m");
+    println!("cargo:rerun-if-changed=src/mac_window.m");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        cc::Build::new()
+            .file("src/sf_symbols.m")
+            .file("src/mac_window.m")
+            .flag("-fobjc-arc")
+            .compile("rusttube_sf_symbols");
+        println!("cargo:rustc-link-lib=framework=AppKit");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+    }
+
     // Release builds unpack a prebuilt libmpv and point this at its import
     // library; pkg-config is not available on the Windows runner.
     if let Ok(dir) = std::env::var("LIBMPV_DIR") {

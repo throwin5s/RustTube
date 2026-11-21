@@ -11,6 +11,9 @@ use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Rect,
     Response, RichText, Sense, Stroke, TextStyle, Ui, Vec2,
 };
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,6 +46,11 @@ pub const RADIUS: u8 = 8;
 pub const RADIUS_SMALL: u8 = 4;
 pub const TOP_BAR_HEIGHT: f32 = 56.0;
 pub const SIDEBAR_WIDTH: f32 = 240.0;
+/// Corner reserved for the custom Windows caption buttons (minimize,
+/// maximize/restore, close). The native frame is gone on Windows, so the app
+/// draws them and everything else on the right keeps clear of them.
+pub const WINDOW_BUTTONS_WIDTH: f32 = 126.0;
+pub const WINDOW_BUTTON_WIDTH: f32 = 42.0;
 
 // --------------------------------------------------------------------- fonts
 
@@ -314,6 +322,256 @@ pub fn nav_row(ui: &mut Ui, label: &str, active: bool) -> Response {
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+// ----------------------------------------------------------------- icon skins
+
+/// The active skin lives in egui's temp data so `paint_icon` stays a free
+/// function and every call site picks up a new skin automatically.
+const SKIN_DATA_ID: &str = "rusttube.icon-skin";
+
+/// Stable names used by `skin.json` and the built-in Lucide fallback.
+pub const ICON_KEYS: &[&str] = &[
+    "play",
+    "pause",
+    "settings",
+    "bookmark",
+    "bookmark-check",
+    "skip-back",
+    "skip-forward",
+    "volume",
+    "volume-muted",
+    "fullscreen",
+    "exit-fullscreen",
+    "back",
+    "forward",
+    "sidebar",
+];
+
+#[derive(Clone)]
+pub struct SkinInfo {
+    pub id: String,
+    pub name: String,
+    pub dir: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct SkinManifest {
+    name: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    author: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    version: u32,
+    /// Cut the seek number into the PNG instead of drawing it over the glyph.
+    #[serde(default)]
+    baked_seek_labels: bool,
+    #[serde(default)]
+    icons: HashMap<String, String>,
+}
+
+struct SkinTextures {
+    icons: HashMap<&'static str, egui::TextureHandle>,
+    baked_seek_labels: bool,
+}
+
+/// Pseudo-skin id for the system symbols. Nothing is stored on disk: the
+/// macOS build asks AppKit for each symbol and uploads the result as a mask.
+pub const SF_SYMBOLS_ID: &str = "sf-symbols";
+pub const SF_SYMBOLS_NAME: &str = "SF Symbols (macOS)";
+
+#[cfg(target_os = "macos")]
+mod sf_native {
+    use super::*;
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_uchar};
+
+    extern "C" {
+        fn rusttube_render_sf_symbol(
+            name: *const c_char,
+            size: u32,
+            with_check: bool,
+            out: *mut c_uchar,
+        ) -> bool;
+    }
+
+    pub fn render(name: &str, size: u32, with_check: bool) -> Option<egui::ColorImage> {
+        let name = CString::new(name).ok()?;
+        let mut pixels = vec![0u8; (size * size * 4) as usize];
+        let ok = unsafe {
+            rusttube_render_sf_symbol(name.as_ptr(), size, with_check, pixels.as_mut_ptr())
+        };
+        if !ok {
+            return None;
+        }
+        let pixels = pixels
+            .chunks_exact(4)
+            .map(|pixel| Color32::from_white_alpha(pixel[3]))
+            .collect();
+        Some(egui::ColorImage::new(
+            [size as usize, size as usize],
+            pixels,
+        ))
+    }
+}
+
+fn read_manifest(dir: &Path) -> Result<SkinManifest, String> {
+    let path = dir.join("skin.json");
+    let text = std::fs::read_to_string(&path).map_err(|err| format!("{}: {err}", path.display()))?;
+    let manifest: SkinManifest =
+        serde_json::from_str(&text).map_err(|err| format!("{}: {err}", path.display()))?;
+    if manifest.name.trim().is_empty() {
+        return Err(format!("{}: name is empty", path.display()));
+    }
+    Ok(manifest)
+}
+
+fn icon_file(dir: &Path, file: &str) -> Result<PathBuf, String> {
+    let relative = Path::new(file);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(format!("icon path must stay inside the skin: {file}"));
+    }
+    Ok(dir.join(relative))
+}
+
+/// Every folder with a readable `skin.json`. The folder name is the id stored
+/// in settings; renaming it after selection falls back to the built-in set
+/// until it is picked again.
+pub fn scan_skins(dir: &Path) -> Vec<SkinInfo> {
+    let _ = std::fs::create_dir_all(dir);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut skins = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let path = entry.path();
+        if let Ok(manifest) = read_manifest(&path) {
+            skins.push(SkinInfo {
+                id: entry.file_name().to_string_lossy().into_owned(),
+                name: manifest.name,
+                dir: path,
+            });
+        }
+    }
+    skins.sort_by_key(|skin| skin.name.to_lowercase());
+    skins
+}
+
+/// Load a skin's PNG masks into textures and make it the active icon set.
+/// Missing or unknown entries fall back to the bundled glyphs, so a partial
+/// skin is still usable.
+pub fn install_skin(ctx: &egui::Context, dir: &Path) -> Result<String, String> {
+    let manifest = read_manifest(dir)?;
+    let mut icons = HashMap::new();
+    for (key, file) in &manifest.icons {
+        let Some(key) = ICON_KEYS.iter().copied().find(|known| known == key) else {
+            continue;
+        };
+        let path = icon_file(dir, file)?;
+        let bytes = std::fs::read(&path).map_err(|err| format!("{}: {err}", path.display()))?;
+        let pixels = image::load_from_memory(&bytes)
+            .map_err(|err| format!("{}: {err}", path.display()))?
+            .to_rgba8();
+        let mask = egui::ColorImage::new(
+            [pixels.width() as usize, pixels.height() as usize],
+            pixels
+                .pixels()
+                .map(|pixel| Color32::from_white_alpha(pixel[3]))
+                .collect(),
+        );
+        let texture = ctx.load_texture(
+            format!("skin:{}:{key}", dir.display()),
+            mask,
+            egui::TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear)),
+        );
+        icons.insert(key, texture);
+    }
+    if icons.is_empty() {
+        return Err("no usable icons in skin".to_string());
+    }
+    let name = manifest.name;
+    ctx.data_mut(|data| {
+        data.insert_temp(
+            egui::Id::new(SKIN_DATA_ID),
+            Arc::new(SkinTextures {
+                icons,
+                baked_seek_labels: manifest.baked_seek_labels,
+            }),
+        );
+    });
+    Ok(name)
+}
+
+#[cfg(target_os = "macos")]
+pub fn install_sf_symbols(ctx: &egui::Context) -> Result<String, String> {
+    const MAP: &[(&str, &str, bool)] = &[
+        ("play", "play.fill", false),
+        ("pause", "pause.fill", false),
+        ("settings", "ellipsis", false),
+        ("bookmark", "bookmark.fill", false),
+        ("bookmark-check", "bookmark.fill", true),
+        ("skip-back", "gobackward.10", false),
+        ("skip-forward", "goforward.10", false),
+        ("volume", "speaker.wave.2.fill", false),
+        ("volume-muted", "speaker.slash.fill", false),
+        ("fullscreen", "arrow.up.left.and.arrow.down.right", false),
+        ("exit-fullscreen", "arrow.down.right.and.arrow.up.left", false),
+        ("back", "chevron.left", false),
+        ("forward", "chevron.right", false),
+        ("sidebar", "line.3.horizontal", false),
+    ];
+
+    let mut icons = HashMap::new();
+    for (key, symbol, with_check) in MAP {
+        let Some(mask) = sf_native::render(symbol, 192, *with_check) else {
+            eprintln!("sf symbols: {symbol} unavailable");
+            continue;
+        };
+        let texture = ctx.load_texture(
+            format!("sf-symbol:{key}"),
+            mask,
+            egui::TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear)),
+        );
+        icons.insert(*key, texture);
+    }
+    if icons.is_empty() {
+        return Err("SF Symbols are unavailable on this macOS version".to_string());
+    }
+    let missing: Vec<&str> = ICON_KEYS
+        .iter()
+        .copied()
+        .filter(|key| !icons.contains_key(key))
+        .collect();
+    if !missing.is_empty() {
+        eprintln!("sf symbols: missing {missing:?}");
+    }
+    ctx.data_mut(|data| {
+        data.insert_temp(
+            egui::Id::new(SKIN_DATA_ID),
+            Arc::new(SkinTextures {
+                icons,
+                baked_seek_labels: true,
+            }),
+        );
+    });
+    Ok(SF_SYMBOLS_NAME.to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn install_sf_symbols(_ctx: &egui::Context) -> Result<String, String> {
+    Err("SF Symbols are only available on macOS".to_string())
+}
+
+pub fn clear_skin(ctx: &egui::Context) {
+    ctx.data_mut(|data| data.remove::<Arc<SkinTextures>>(egui::Id::new(SKIN_DATA_ID)));
+}
+
 // --------------------------------------------------------------------- icons
 
 /// Small monochrome transport/status icons painted with shapes.
@@ -333,6 +591,29 @@ pub enum Icon {
     VolumeMuted,
     Fullscreen,
     ExitFullscreen,
+}
+
+impl Icon {
+    /// Key used by skin manifests. Keep these stable: they are the public
+    /// contract between the app and any icon pack.
+    pub fn key(self) -> &'static str {
+        match self {
+            Icon::Play => "play",
+            Icon::Pause => "pause",
+            Icon::Settings => "settings",
+            Icon::Bookmark => "bookmark",
+            Icon::BookmarkCheck => "bookmark-check",
+            Icon::SkipBack => "skip-back",
+            Icon::SkipForward => "skip-forward",
+            Icon::Volume => "volume",
+            Icon::VolumeMuted => "volume-muted",
+            Icon::Fullscreen => "fullscreen",
+            Icon::ExitFullscreen => "exit-fullscreen",
+            Icon::Back => "back",
+            Icon::Forward => "forward",
+            Icon::Sidebar => "sidebar",
+        }
+    }
 }
 
 /// Bright primary transport control: a solid disc that stays legible over
@@ -402,6 +683,20 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: &Icon, color: Color
     let c = rect.center();
     let s = rect.width().min(rect.height()) * 0.5;
     use Icon::*;
+
+    let skin = painter
+        .ctx()
+        .data(|data| data.get_temp::<Arc<SkinTextures>>(egui::Id::new(SKIN_DATA_ID)));
+    if let Some(skin) = &skin {
+        if let Some(texture) = skin.icons.get(icon.key()) {
+            paint_texture(painter, rect, texture, color);
+            if matches!(icon, SkipBack | SkipForward) && !skin.baked_seek_labels {
+                paint_seek_number(painter, rect, color);
+            }
+            return;
+        }
+    }
+
     let asset = match icon {
         Play => Some(("play", &include_bytes!("../assets/lucide/play.png")[..])),
         Pause => Some(("pause", &include_bytes!("../assets/lucide/pause.png")[..])),
@@ -435,23 +730,9 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: &Icon, color: Color
             ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
             texture
         });
-        // Keep the raster on the physical pixel grid. A half-pixel offset is
-        // enough to smear a 24 px glyph on a 100% display.
-        let ppp = painter.ctx().pixels_per_point();
-        let pixel = |value: f32| (value * ppp).round() / ppp;
-        let snapped = Rect::from_center_size(
-            egui::pos2(pixel(c.x), pixel(c.y)),
-            Vec2::splat(pixel(rect.width().min(rect.height()))),
-        );
-        painter.image(texture.id(), snapped, Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), color);
+        paint_texture(painter, rect, &texture, color);
         if matches!(icon, SkipBack | SkipForward) {
-            painter.text(
-                egui::pos2(pixel(c.x), pixel(c.y + 1.0)),
-                Align2::CENTER_CENTER,
-                "10",
-                semibold(10.0),
-                color,
-            );
+            paint_seek_number(painter, rect, color);
         }
         return;
     }
@@ -490,6 +771,119 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: &Icon, color: Color
         }
         _ => unreachable!("player icons have bundled assets"),
     }
+}
+
+/// Caption glyphs for the window controls. Painted rather than taken from an
+/// icon pack: they are chrome, not player icons, so a skin must not change a
+/// close button into something else.
+#[derive(Clone, Copy)]
+pub enum WindowGlyph {
+    Minimize,
+    Maximize,
+    Restore,
+    Close,
+}
+
+pub fn paint_window_glyph(
+    painter: &egui::Painter,
+    rect: Rect,
+    glyph: WindowGlyph,
+    color: Color32,
+) {
+    let c = rect.center();
+    let s = rect.width().min(rect.height()) * 0.5;
+    let stroke = Stroke::new(1.2_f32, color);
+    match glyph {
+        WindowGlyph::Minimize => {
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - s, c.y + s * 0.3),
+                    egui::pos2(c.x + s, c.y + s * 0.3),
+                ],
+                stroke,
+            );
+        }
+        WindowGlyph::Maximize => {
+            painter.rect_stroke(
+                Rect::from_center_size(c, Vec2::splat(s * 1.6)),
+                CornerRadius::same(1),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        WindowGlyph::Restore => {
+            let back = Rect::from_min_size(
+                egui::pos2(c.x - s * 0.85, c.y - s * 0.8),
+                Vec2::splat(s * 1.35),
+            );
+            let front = Rect::from_min_size(
+                egui::pos2(c.x - s * 0.5, c.y - s * 0.35),
+                Vec2::splat(s * 1.35),
+            );
+            // Only the top and right of the back square show, the way the
+            // Windows restore glyph overlaps its two frames.
+            painter.line_segment([back.left_top(), back.right_top()], stroke);
+            painter.line_segment([back.right_top(), back.right_bottom()], stroke);
+            painter.rect_stroke(
+                front,
+                CornerRadius::same(1),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        WindowGlyph::Close => {
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - s * 0.6, c.y - s * 0.6),
+                    egui::pos2(c.x + s * 0.6, c.y + s * 0.6),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x + s * 0.6, c.y - s * 0.6),
+                    egui::pos2(c.x - s * 0.6, c.y + s * 0.6),
+                ],
+                stroke,
+            );
+        }
+    }
+}
+
+/// Draw a tinted glyph mask, snapped to the physical pixel grid so a 24 px
+/// icon stays crisp on a 100% display.
+fn paint_texture(
+    painter: &egui::Painter,
+    rect: Rect,
+    texture: &egui::TextureHandle,
+    color: Color32,
+) {
+    let c = rect.center();
+    let ppp = painter.ctx().pixels_per_point();
+    let pixel = |value: f32| (value * ppp).round() / ppp;
+    let snapped = Rect::from_center_size(
+        egui::pos2(pixel(c.x), pixel(c.y)),
+        Vec2::splat(pixel(rect.width().min(rect.height()))),
+    );
+    painter.image(
+        texture.id(),
+        snapped,
+        Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        color,
+    );
+}
+
+fn paint_seek_number(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let ppp = painter.ctx().pixels_per_point();
+    let pixel = |value: f32| (value * ppp).round() / ppp;
+    painter.text(
+        egui::pos2(pixel(c.x), pixel(c.y + 1.0)),
+        Align2::CENTER_CENTER,
+        "10",
+        semibold(10.0),
+        color,
+    );
 }
 
 /// Rounded placeholder used while a thumbnail downloads (or when it failed).
@@ -713,6 +1107,59 @@ mod tests {
             assert!(value >= previous, "curve must not go backwards");
             previous = value;
         }
+    }
+
+    #[test]
+    fn skin_manifest_loads_known_icons_and_ignores_unknown_ones() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rusttube-skin-{}-{stamp}", std::process::id()));
+        let dir = root.join("reel");
+        std::fs::create_dir_all(&dir).unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 255, 255, 255]))
+            .save(dir.join("play.png"))
+            .unwrap();
+        std::fs::write(
+            dir.join("skin.json"),
+            r#"{"name":"Test Reel","baked_seek_labels":true,"icons":{"play":"play.png","not-a-real-icon":"missing.png"}}"#,
+        )
+        .unwrap();
+
+        let skins = scan_skins(&root);
+        assert_eq!(skins.len(), 1);
+        assert_eq!(skins[0].name, "Test Reel");
+        assert!(icon_file(&dir, "../play.png").is_err());
+
+        let ctx = egui::Context::default();
+        assert_eq!(install_skin(&ctx, &dir).unwrap(), "Test Reel");
+        let active = ctx
+            .data(|data| data.get_temp::<Arc<SkinTextures>>(egui::Id::new(SKIN_DATA_ID)))
+            .expect("skin installed");
+        assert!(active.icons.contains_key("play"));
+        assert!(active.baked_seek_labels);
+
+        clear_skin(&ctx);
+        assert!(ctx
+            .data(|data| data.get_temp::<Arc<SkinTextures>>(egui::Id::new(SKIN_DATA_ID)))
+            .is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sf_symbols_render_and_install() {
+        let ctx = egui::Context::default();
+        assert!(install_sf_symbols(&ctx).is_ok());
+        let active = ctx
+            .data(|data| data.get_temp::<Arc<SkinTextures>>(egui::Id::new(SKIN_DATA_ID)))
+            .expect("SF Symbols installed");
+        assert!(active.icons.contains_key("play"));
+        assert!(active.icons.contains_key("skip-back"));
+        assert!(active.icons.contains_key("bookmark-check"));
+        assert!(active.baked_seek_labels);
+        clear_skin(&ctx);
     }
 
     #[test]

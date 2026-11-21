@@ -1,5 +1,7 @@
 /target
 /gen
+# Private icon skin packs and their build sources
+/dist/
 .DS_Store
 *.log
 /.freebuff/

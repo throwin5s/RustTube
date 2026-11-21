@@ -2765,6 +2765,7 @@ dependencies = [
 name = "rusttube"
 version = "0.3.13"
 dependencies = [
+ "cc",
  "chrono",
  "eframe",
  "egui",

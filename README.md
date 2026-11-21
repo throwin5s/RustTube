@@ -20,6 +20,26 @@ font. Player glyphs use bundled [Lucide 0.468.0](https://github.com/lucide-icons
 your subscriptions, a top bar with search and sync state, a scrolling content
 area, and a player bar pinned to the bottom once something is playing.
 
+### Icon skins
+
+Player and status icons can be replaced without rebuilding. A skin is a folder
+under the app data directory:
+
+- macOS: `~/Library/Application Support/RustTube/skins/`
+- Windows: `%APPDATA%\RustTube\skins\`
+- Linux: `~/.local/share/rusttube/skins/`
+
+Each folder contains `skin.json` and white-on-transparent PNG masks. Pick it in
+Settings → Interface → Icon skin, then use **Rescan skins** after adding or
+editing one. `RUSTTUBE_SKINS_DIR` points at a portable skins folder and
+`RUSTTUBE_ICON_SKIN=<name>` forces a skin for one launch. Missing entries fall
+back to the bundled Lucide glyphs.
+
+On macOS the dropdown also offers **SF Symbols (macOS)**. That mode asks AppKit
+for Apple's system symbols at runtime, so no SF Symbols files are stored in the
+app or the skin pack. It is intentionally not available on Windows, where Apple
+does not license the symbols; use Reel there.
+
 | Area | What it does |
 | --- | --- |
 | Trending | Region-based card grid with thumbnails, duration badges and view counts |

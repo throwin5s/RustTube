@@ -149,6 +149,7 @@ struct SettingsDraft {
     sidebar_hover: bool,
     watch_zoom: bool,
     anim_speed: String,
+    icon_skin: String,
 }
 
 /// The card-to-player opening motion. The route only changes when this ends,
@@ -186,6 +187,25 @@ const CHANNEL_PREFETCH_DISTANCE: f32 = 900.0;
 const CHANNEL_PAGE_LIMIT: u32 = 25;
 /// Duration of the thumbnail-to-player expand.
 const REVEAL_DURATION: f32 = 0.32;
+/// How quickly the top bar slides in and out. It is chrome rather than a page,
+/// so it moves faster than the sidebar slide.
+const CHROME_DURATION: f32 = 0.16;
+/// Extra slack beyond the top bar that still counts as "near the chrome", so
+/// the bar does not flicker while the pointer is over it.
+const CHROME_HOT_MARGIN: f32 = 14.0;
+/// Height of the top strip that reveals the bar while it is hidden. It stays
+/// tight so browsing near the top of a page does not keep popping it open.
+const TOP_BAR_EDGE: f32 = 16.0;
+/// Width of the top-left hotspot that reveals the macOS traffic lights.
+const TRAFFIC_HOT_WIDTH: f32 = 110.0;
+/// Room left of the Windows caption buttons that still counts as near them.
+const CAPTION_HOT_PAD: f32 = 48.0;
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    /// Hides or shows the close, minimize and zoom buttons of the app window.
+    fn rusttube_set_traffic_lights_visible(visible: std::os::raw::c_int);
+}
 
 /// What the updater is doing right now; drives the Settings card and the
 /// top-bar notice.
@@ -702,6 +722,19 @@ pub struct App {
     search_query: String,
     search_page: u32,
     search_rect: Option<Rect>,
+    /// 0–1 reveal of the whole top bar, which is chrome: it only shows up
+    /// while the pointer is near the top of the window.
+    topbar_reveal: f32,
+    topbar_from: f32,
+    topbar_to: f32,
+    topbar_started: Instant,
+    /// Whether the search field had the keyboard last frame; the bar must not
+    /// slide away from someone who is typing in it.
+    search_focused: bool,
+    /// Last traffic-light state applied on macOS. `None` forces a re-apply
+    /// after fullscreen, where the titlebar is out of the app's hands.
+    #[cfg(target_os = "macos")]
+    traffic_lights: Option<bool>,
     suggestions: Vec<ChannelCard>,
     suggest_for: String,
     suggest_pending: Option<(String, Instant)>,
@@ -727,6 +760,7 @@ pub struct App {
     playlist_picker: bool,
     delete_playlist_armed: Option<String>,
     subs: Vec<Subscription>,
+    skins: Vec<t::SkinInfo>,
 
     settings: SettingsDraft,
     sync_status: SyncStatus,
@@ -906,6 +940,7 @@ impl App {
             playlist_picker: false,
             delete_playlist_armed: None,
             subs: Vec::new(),
+            skins: Vec::new(),
             settings: SettingsDraft::default(),
             sync_status: SyncStatus::default(),
             sync_busy: false,
@@ -951,6 +986,13 @@ impl App {
                 .unwrap_or(Duration::from_secs(4)),
             shot_requested: false,
             search_rect: None,
+            topbar_reveal: 0.0,
+            topbar_from: 0.0,
+            topbar_to: 0.0,
+            topbar_started: Instant::now(),
+            search_focused: false,
+            #[cfg(target_os = "macos")]
+            traffic_lights: Some(false),
             suggestions: Vec::new(),
             suggest_for: String::new(),
             suggest_pending: None,
@@ -965,6 +1007,9 @@ impl App {
 
         app.refresh_subs();
         app.load_settings_draft();
+        app.skins = t::scan_skins(&skins_dir());
+        let skin_ctx = app.ctx.clone();
+        app.apply_icon_skin(&skin_ctx, false);
         app.refresh_sync_status();
         app.adopt_cloud_if_unconfigured();
         app.maybe_sync_on_launch();
@@ -1472,6 +1517,7 @@ impl App {
                     &db::get_setting(conn, "anim_speed").unwrap_or_default(),
                 )
                 .to_string(),
+                icon_skin: db::get_setting(conn, "icon_skin").unwrap_or_default(),
                 auto_update: db::get_setting(conn, "auto_update")
                     .map(|value| value != "0")
                     .unwrap_or(true),
@@ -1555,6 +1601,7 @@ impl App {
                 if draft.watch_zoom { "1" } else { "0" },
             );
             let _ = db::set_setting(conn, "anim_speed", anim_preset(&draft.anim_speed));
+            let _ = db::set_setting(conn, "icon_skin", draft.icon_skin.trim());
             let _ = db::set_setting(
                 conn,
                 "auto_update",
@@ -1602,6 +1649,64 @@ impl App {
         }
         if saved != Some(true) {
             self.toast("Could not save settings");
+        }
+    }
+
+    /// Install the selected skin, or fall back to the bundled icons. `announce`
+    /// stays false at launch so a skin missing on another machine does not
+    /// toast before the window is up.
+    fn apply_icon_skin(&mut self, ctx: &egui::Context, announce: bool) {
+        let selected = std::env::var("RUSTTUBE_ICON_SKIN")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| self.settings.icon_skin.trim().to_string());
+
+        if selected.is_empty() {
+            t::clear_skin(ctx);
+            if announce {
+                self.toast("Icon skin: built-in");
+            }
+            return;
+        }
+
+        if selected == t::SF_SYMBOLS_ID {
+            match t::install_sf_symbols(ctx) {
+                Ok(name) => {
+                    if announce {
+                        self.toast(format!("Icon skin: {name}"));
+                    }
+                }
+                Err(err) => {
+                    eprintln!("icon skin: {err}");
+                    t::clear_skin(ctx);
+                    if announce {
+                        self.toast(format!("Couldn’t load SF Symbols: {err}"));
+                    }
+                }
+            }
+            return;
+        }
+
+        let dir = self
+            .skins
+            .iter()
+            .find(|skin| skin.id == selected)
+            .map(|skin| skin.dir.clone())
+            .unwrap_or_else(|| skins_dir().join(&selected));
+        match t::install_skin(ctx, &dir) {
+            Ok(name) => {
+                if announce {
+                    self.toast(format!("Icon skin: {name}"));
+                }
+            }
+            Err(err) => {
+                eprintln!("icon skin: {err}");
+                t::clear_skin(ctx);
+                if announce {
+                    self.toast(format!("Couldn’t load icon skin: {err}"));
+                }
+            }
         }
     }
 
@@ -2530,17 +2635,35 @@ impl App {
     // ------------------------------------------------------------------ chrome
 
     fn top_bar(&mut self, ctx: &egui::Context) {
+        // Hidden: the panel is not added at all, so the page gets the space
+        // back instead of leaving an empty strip behind.
+        let reveal = self.topbar_reveal;
+        if reveal <= 0.01 {
+            self.search_focused = false;
+            return;
+        }
         let center = ctx.screen_rect().center().x;
         let field_width = 430.0;
         let group_width = 28.0 + 8.0 + field_width + 8.0 + 28.0;
+        // On Windows the caption buttons own this corner, so the rest of the
+        // bar's right-hand controls keep clear of them.
+        let reserved = if cfg!(windows) {
+            t::WINDOW_BUTTONS_WIDTH
+        } else {
+            0.0
+        };
         egui::TopBottomPanel::top("top")
-            .exact_height(t::TOP_BAR_HEIGHT)
+            .exact_height(t::TOP_BAR_HEIGHT * reveal)
             .frame(
-                egui::Frame::NONE
-                    .fill(t::BG)
-                    .inner_margin(Margin::symmetric(20, 10)),
+                egui::Frame::NONE.fill(t::BG).inner_margin(Margin::symmetric(
+                    20,
+                    // Shrink the padding with the bar, so the collapsing
+                    // panel never has more margin than height.
+                    (10.0 * reveal).round() as i8,
+                )),
             )
             .show(ctx, |ui| {
+                ui.set_opacity(reveal);
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     // The macOS traffic lights sit over the content when the
@@ -2592,6 +2715,7 @@ impl App {
                         .margin(Vec2::new(10.0, 8.0));
                     let response = ui.add(field);
                     self.search_rect = Some(response.rect);
+                    self.search_focused = response.has_focus();
                     if response.changed() {
                         // Editing again re-arms the dropdown for this query.
                         self.suggest_dismissed = None;
@@ -2649,7 +2773,7 @@ impl App {
                 if let Some(release) = self.update.installable().cloned() {
                     let pill = Rect::from_min_size(
                         egui::pos2(
-                            ui.max_rect().right() - 136.0,
+                            ui.max_rect().right() - reserved - 136.0,
                             ui.max_rect().center().y - 13.0,
                         ),
                         Vec2::new(96.0, 26.0),
@@ -2680,7 +2804,7 @@ impl App {
                 if self.update.installable().is_none() {
                     let chip = Rect::from_min_size(
                         egui::pos2(
-                            ui.max_rect().right() - 158.0,
+                            ui.max_rect().right() - reserved - 158.0,
                             ui.max_rect().center().y - 13.0,
                         ),
                         Vec2::new(118.0, 26.0),
@@ -2692,7 +2816,7 @@ impl App {
                 // only when the pointer enters the top-right corner zone.
                 let toggle_rect = Rect::from_min_size(
                     egui::pos2(
-                        ui.max_rect().right() - 28.0,
+                        ui.max_rect().right() - reserved - 28.0,
                         ui.max_rect().center().y - 14.0,
                     ),
                     Vec2::splat(28.0),
@@ -2751,6 +2875,13 @@ impl App {
                     });
                 }
 
+                // Windows has no native frame left to host the caption
+                // buttons, so the bar draws them. Like the macOS traffic
+                // lights they stay hidden until the pointer comes near.
+                if cfg!(windows) {
+                    self.caption_buttons(ui, ctx);
+                }
+
                 // The native titlebar is hidden, so empty top-bar space moves
                 // the window explicitly. Restrict the drag zones to the left
                 // and right of the centered controls so the search field and
@@ -2769,7 +2900,7 @@ impl App {
                 } else {
                     60.0
                 };
-                let right_end = (bar.right() - pill_width).max(right_start);
+                let right_end = (bar.right() - reserved - pill_width).max(right_start);
                 let zones = [
                     (
                         "window-drag-left",
@@ -2795,8 +2926,211 @@ impl App {
                         ui.ctx()
                             .send_viewport_cmd(egui::ViewportCommand::StartDrag);
                     }
+                    // The undecorated Windows window has no titlebar to
+                    // double-click, so the drag surface does it instead.
+                    #[cfg(windows)]
+                    if drag.double_clicked() {
+                        let maximized =
+                            ui.ctx().input(|input| input.viewport().maximized.unwrap_or(false));
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                    }
                 }
             });
+    }
+
+    /// The top bar is chrome, not content: the whole thing stays away until
+    /// the pointer comes near the top of the window.
+    fn animate_top_bar(&mut self, ctx: &egui::Context) {
+        // Once open, the bar keeps itself open while the pointer is anywhere
+        // over it; closed, only the top edge of the window reopens it.
+        let band = if self.topbar_reveal > 0.01 {
+            t::TOP_BAR_HEIGHT + CHROME_HOT_MARGIN
+        } else {
+            TOP_BAR_EDGE
+        };
+        let near = ctx
+            .pointer_hover_pos()
+            .is_some_and(|pos| pos.y <= ctx.screen_rect().top() + band);
+        // A field being typed in, or a channel dropdown under it, must not
+        // disappear while it is in use.
+        let target = if near || self.search_focused || self.suggest_visible {
+            1.0
+        } else {
+            0.0
+        };
+        if target != self.topbar_to {
+            self.topbar_from = self.topbar_reveal;
+            self.topbar_to = target;
+            self.topbar_started = Instant::now();
+        }
+        let duration = (CHROME_DURATION * self.anim_scale()).max(0.001);
+        let progress = (self.topbar_started.elapsed().as_secs_f32() / duration).clamp(0.0, 1.0);
+        self.topbar_reveal =
+            self.topbar_from + (self.topbar_to - self.topbar_from) * t::smoothstep(progress);
+        if progress < 1.0 {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Minimize, maximize/restore and close for the undecorated Windows window.
+    /// They appear only over the top-right corner, so they stay out of the way
+    /// exactly like the macOS traffic lights.
+    fn caption_buttons(&self, ui: &mut Ui, ctx: &egui::Context) {
+        let bar = ui.max_rect();
+        let near = ctx.pointer_hover_pos().is_some_and(|pos| {
+            let screen = ctx.screen_rect();
+            pos.x >= screen.right() - t::WINDOW_BUTTONS_WIDTH - CAPTION_HOT_PAD
+                && pos.y <= screen.top() + t::TOP_BAR_HEIGHT + CHROME_HOT_MARGIN
+        });
+        if !near {
+            return;
+        }
+
+        let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+        let glyphs = [
+            t::WindowGlyph::Minimize,
+            if maximized {
+                t::WindowGlyph::Restore
+            } else {
+                t::WindowGlyph::Maximize
+            },
+            t::WindowGlyph::Close,
+        ];
+        for (index, glyph) in glyphs.into_iter().enumerate() {
+            let left =
+                bar.right() - t::WINDOW_BUTTONS_WIDTH + index as f32 * t::WINDOW_BUTTON_WIDTH;
+            let rect = Rect::from_min_size(
+                egui::pos2(left, bar.top()),
+                Vec2::new(t::WINDOW_BUTTON_WIDTH, bar.height()),
+            );
+            let close = matches!(glyph, t::WindowGlyph::Close);
+            let response = ui
+                .interact(rect, ui.id().with(("caption", index)), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if response.hovered() {
+                ui.painter().rect_filled(
+                    rect.shrink2(Vec2::new(1.0, 3.0)),
+                    CornerRadius::same(t::RADIUS_SMALL),
+                    if close { t::DANGER } else { t::PANEL_2 },
+                );
+            }
+            t::paint_window_glyph(
+                ui.painter(),
+                Rect::from_center_size(rect.center(), Vec2::splat(12.0)),
+                glyph,
+                if response.hovered() {
+                    Color32::WHITE
+                } else {
+                    t::DIM
+                },
+            );
+            if response.clicked() {
+                match index {
+                    0 => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                    1 => ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized)),
+                    _ => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                }
+            }
+        }
+    }
+
+    /// An undecorated Windows window loses the native resize border with the
+    /// frame, so the app hit-tests the edges and hands the drag back to the OS.
+    fn resize_edges(&self, ctx: &egui::Context) {
+        if !cfg!(windows) {
+            return;
+        }
+        use egui::viewport::ResizeDirection;
+
+        let screen = ctx.screen_rect();
+        let edge = 6.0_f32.min(screen.height() * 0.25);
+        let corner = 16.0_f32.min(screen.width() * 0.25);
+        let (left, top, right, bottom) =
+            (screen.left(), screen.top(), screen.right(), screen.bottom());
+        let zones = [
+            (
+                ResizeDirection::NorthWest,
+                Rect::from_min_max(screen.left_top(), egui::pos2(left + corner, top + corner)),
+                egui::CursorIcon::ResizeNwSe,
+            ),
+            (
+                ResizeDirection::North,
+                Rect::from_min_max(
+                    egui::pos2(left + corner, top),
+                    egui::pos2(right - corner, top + edge),
+                ),
+                egui::CursorIcon::ResizeVertical,
+            ),
+            (
+                ResizeDirection::NorthEast,
+                Rect::from_min_max(
+                    egui::pos2(right - corner, top),
+                    egui::pos2(right, top + corner),
+                ),
+                egui::CursorIcon::ResizeNeSw,
+            ),
+            (
+                ResizeDirection::West,
+                Rect::from_min_max(
+                    egui::pos2(left, top + corner),
+                    egui::pos2(left + edge, bottom - corner),
+                ),
+                egui::CursorIcon::ResizeHorizontal,
+            ),
+            (
+                ResizeDirection::East,
+                Rect::from_min_max(
+                    egui::pos2(right - edge, top + corner),
+                    egui::pos2(right, bottom - corner),
+                ),
+                egui::CursorIcon::ResizeHorizontal,
+            ),
+            (
+                ResizeDirection::SouthWest,
+                Rect::from_min_max(
+                    egui::pos2(left, bottom - corner),
+                    egui::pos2(left + corner, bottom),
+                ),
+                egui::CursorIcon::ResizeNeSw,
+            ),
+            (
+                ResizeDirection::South,
+                Rect::from_min_max(
+                    egui::pos2(left + corner, bottom - edge),
+                    egui::pos2(right - corner, bottom),
+                ),
+                egui::CursorIcon::ResizeVertical,
+            ),
+            (
+                ResizeDirection::SouthEast,
+                Rect::from_min_max(
+                    egui::pos2(right - corner, bottom - corner),
+                    egui::pos2(right, bottom),
+                ),
+                egui::CursorIcon::ResizeNwSe,
+            ),
+        ];
+
+        let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("window-edges"));
+        let ui = Ui::new(
+            ctx.clone(),
+            egui::Id::new("window-edges-ui"),
+            egui::UiBuilder::new().layer_id(layer).max_rect(screen),
+        );
+        for (index, (direction, rect, cursor)) in zones.into_iter().enumerate() {
+            let response = ui.interact(
+                rect,
+                egui::Id::new(("window-edge", index)),
+                Sense::click_and_drag(),
+            );
+            if response.hovered() {
+                ctx.set_cursor_icon(cursor);
+            }
+            if response.is_pointer_button_down_on() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+            }
+        }
     }
 
     /// Eased sidebar reveal. With hover mode off it snaps, so the classic
@@ -2858,6 +3192,30 @@ impl App {
         let _ = self.with_db(|conn| db::set_setting(conn, "anim_speed", preset));
     }
 
+    /// The macOS traffic lights are chrome too: they stay hidden until the
+    /// pointer comes near their corner. The native call only runs when the
+    /// wanted state changes, so a still pointer costs nothing.
+    #[cfg(target_os = "macos")]
+    fn sync_traffic_lights(&mut self, ctx: &egui::Context, immersive: bool) {
+        if immersive || self.fullscreen_pending.is_some() {
+            // Fullscreen owns the titlebar, and a transition in flight may
+            // rebuild the window buttons; re-apply once it has settled.
+            self.traffic_lights = None;
+            return;
+        }
+        let visible = ctx.pointer_hover_pos().is_some_and(|pos| {
+            let screen = ctx.screen_rect();
+            pos.x <= screen.left() + TRAFFIC_HOT_WIDTH
+                && pos.y <= screen.top() + t::TOP_BAR_HEIGHT + CHROME_HOT_MARGIN
+        });
+        if self.traffic_lights != Some(visible) {
+            self.traffic_lights = Some(visible);
+            unsafe {
+                rusttube_set_traffic_lights_visible(visible as std::os::raw::c_int);
+            }
+        }
+    }
+
     /// An external MPV window has nothing to fill the screen with, so only the
     /// embedded player can go immersive.
     fn can_go_fullscreen(&self) -> bool {
@@ -2879,7 +3237,9 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
             if self.fullscreen_fallback {
                 self.fullscreen_fallback = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+                // Windows is undecorated by design: the bar draws its own
+                // caption buttons, so the native frame must not come back.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!cfg!(windows)));
                 if let Some(size) = self.fullscreen_restore.take() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
                 }
@@ -2904,7 +3264,8 @@ impl App {
         // the mode is still genuinely edge-to-edge.
         if !self.fullscreen && self.fullscreen_fallback {
             self.fullscreen_fallback = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+            // See above: an undecorated Windows window has to stay that way.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!cfg!(windows)));
             if let Some(size) = self.fullscreen_restore.take() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
             }
@@ -5401,6 +5762,78 @@ impl App {
                             .color(t::DIM_2),
                     );
                     ui.add_space(10.0);
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("Icon skin").size(12.0).color(t::DIM));
+                    let current_skin = if self.settings.icon_skin.is_empty() {
+                        "RustTube (built-in)".to_string()
+                    } else if self.settings.icon_skin == t::SF_SYMBOLS_ID {
+                        t::SF_SYMBOLS_NAME.to_string()
+                    } else {
+                        self.skins
+                            .iter()
+                            .find(|skin| skin.id == self.settings.icon_skin)
+                            .map(|skin| skin.name.clone())
+                            .unwrap_or_else(|| {
+                                format!("{} (missing)", self.settings.icon_skin)
+                            })
+                    };
+                    let mut chosen = self.settings.icon_skin.clone();
+                    egui::ComboBox::from_id_salt("icon_skin")
+                        .width(190.0)
+                        .selected_text(current_skin)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut chosen,
+                                String::new(),
+                                "RustTube (built-in)",
+                            );
+                            #[cfg(target_os = "macos")]
+                            ui.selectable_value(
+                                &mut chosen,
+                                t::SF_SYMBOLS_ID.to_string(),
+                                t::SF_SYMBOLS_NAME,
+                            );
+                            for skin in &self.skins {
+                                ui.selectable_value(
+                                    &mut chosen,
+                                    skin.id.clone(),
+                                    skin.name.as_str(),
+                                );
+                            }
+                        });
+                    if chosen != self.settings.icon_skin {
+                        self.settings.icon_skin = chosen;
+                        let skin_id = self.settings.icon_skin.clone();
+                        let _ = self.with_db(|conn| {
+                            db::set_setting(conn, "icon_skin", &skin_id)
+                        });
+                        self.apply_icon_skin(ui.ctx(), true);
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if t::quiet_button(ui, "Rescan skins").clicked() {
+                            self.skins = t::scan_skins(&skins_dir());
+                            self.apply_icon_skin(ui.ctx(), true);
+                        }
+                        let path = skins_dir().display().to_string();
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("Folder: {path}"))
+                                    .size(10.5)
+                                    .color(t::DIM_2),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(path);
+                    });
+                    ui.label(
+                        RichText::new(
+                            "Optional. A folder skin, or the system SF Symbols on macOS; nothing leaves this machine.",
+                        )
+                        .size(11.0)
+                        .color(t::DIM_2),
+                    );
+                    ui.add_space(12.0);
                     let mut hover = self.settings.sidebar_hover;
                     if ui.checkbox(&mut hover, "Reveal the sidebar on hover").changed() {
                         self.settings.sidebar_hover = hover;
@@ -6407,6 +6840,7 @@ impl eframe::App for App {
         }
         self.hover_now = None;
         self.animate_sidebar(ctx);
+        self.animate_top_bar(ctx);
         let immersive = self.fullscreen && self.can_go_fullscreen();
         if !immersive {
             if self.sidebar_hover && !self.sidebar_visible {
@@ -6423,7 +6857,10 @@ impl eframe::App for App {
                 self.top_bar(ctx);
             }
             self.sidebar_grip(ctx);
+            self.resize_edges(ctx);
         }
+        #[cfg(target_os = "macos")]
+        self.sync_traffic_lights(ctx, immersive);
 
         // Immersive mode owns the whole window: no inner margin, no page
         // background, just black so the video can go edge to edge.
@@ -6779,6 +7216,13 @@ mod tests {
             CHANNEL_PAGE_LIMIT
         ));
     }
+}
+
+fn skins_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("RUSTTUBE_SKINS_DIR") {
+        return PathBuf::from(dir);
+    }
+    data_dir().join("skins")
 }
 
 fn data_dir() -> PathBuf {
