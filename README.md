@@ -223,11 +223,11 @@ every five minutes after that, always pull → merge → push.
 Folder mode still works for a network share or anything else that syncs, and
 WebDAV covers Nextcloud/ownCloud-style servers.
 
-**MEGA without a desktop client** uses rclone: pick **rclone**, enter a remote
-path such as `mega:RustTube`, and run the bundled wizard once per machine
-(`rclone config` → new remote → name it `mega` → choose MEGA → email, password
-and 2FA code). RustTube drives the rclone that ships inside the app, so there is
-no separate install and RustTube never stores your MEGA password.
+**MEGA without a desktop client** uses rclone: pick **rclone** and run the
+bundled wizard once per machine (`rclone config` → new remote → choose MEGA →
+email, password and 2FA code). RustTube lists the remotes rclone already has as
+clickable chips and stores the path (e.g. `MegaRustTube:RustTube`) itself, so
+there is nothing to retype or install, and it never stores your MEGA password.
 
 ### Merge rules
 

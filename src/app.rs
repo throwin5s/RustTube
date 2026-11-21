@@ -143,6 +143,8 @@ struct SettingsDraft {
     sync_auto: bool,
     /// Whether the rclone binary answered when this page opened.
     rclone_ok: bool,
+    /// Remote names from `rclone listremotes`, read once per settings open.
+    rclone_remotes: Vec<String>,
     auto_update: bool,
     sidebar_hover: bool,
     watch_zoom: bool,
@@ -1487,7 +1489,8 @@ impl App {
                 webdav_pass: String::new(),
                 has_password: sync.has_password,
                 sync_auto: sync.auto,
-                rclone_ok: sync::rclone_works(),
+                rclone_ok: false,
+                rclone_remotes: Vec::new(),
             }
         }) else {
             return;
@@ -1500,6 +1503,15 @@ impl App {
         self.anim_speed = draft.anim_speed.clone();
         if !self.sidebar_hover {
             self.sidebar_reveal = if self.sidebar_visible { 1.0 } else { 0.0 };
+        }
+        // The rclone wizard runs outside the app, so read its remotes here:
+        // after it finishes, the only one is prefilled and one click away.
+        draft.rclone_ok = sync::rclone_works();
+        draft.rclone_remotes = sync::rclone_remotes();
+        if draft.sync_mode == "rclone" && draft.sync_rclone.trim().is_empty() {
+            if let [name] = draft.rclone_remotes.as_slice() {
+                draft.sync_rclone = format!("{name}:RustTube");
+            }
         }
         self.settings = draft;
     }
@@ -1668,6 +1680,7 @@ impl App {
     }
 
     fn maybe_sync_on_launch(&mut self) {
+        self.adopt_rclone_if_needed();
         let settings = self
             .with_db(|conn| SyncSettings::load(conn))
             .unwrap_or_default();
@@ -1683,6 +1696,7 @@ impl App {
         if self.sync_busy || self.last_auto_sync.elapsed() < Duration::from_secs(300) {
             return;
         }
+        self.adopt_rclone_if_needed();
         let settings = self
             .with_db(|conn| SyncSettings::load(conn))
             .unwrap_or_default();
@@ -1703,6 +1717,9 @@ impl App {
         if self.sync_busy {
             return;
         }
+        // Setting up the client is the whole setup: if the wizard has written
+        // a remote, use it instead of complaining that the field is empty.
+        self.adopt_rclone_if_needed();
         let Some(settings) = self.with_db(|conn| SyncSettings::load(conn)) else {
             return;
         };
@@ -1733,6 +1750,70 @@ impl App {
             let _ = tx.send(Msg::Sync(result));
             ctx.request_repaint();
         });
+    }
+
+    /// The rclone wizard writes its remote outside RustTube, so "run the
+    /// wizard" is the whole setup: when sync is on rclone but no path is stored
+    /// yet, adopt the only remote that exists.
+    fn adopt_rclone_if_needed(&mut self) {
+        let Some(mut settings) = self.with_db(|conn| SyncSettings::load(conn)) else {
+            return;
+        };
+        if settings.mode != "rclone" || !settings.rclone.trim().is_empty() {
+            return;
+        }
+        let remotes = sync::rclone_remotes();
+        let [name] = remotes.as_slice() else {
+            return;
+        };
+        settings.rclone = format!("{name}:RustTube");
+        if self.with_db(|conn| settings.save(conn).is_ok()) != Some(true) {
+            return;
+        }
+        self.settings.sync_rclone = settings.rclone.clone();
+        self.refresh_sync_status();
+        self.toast(format!("Using the rclone remote {name}:RustTube"));
+    }
+
+    /// The one true sync state, shared by the top bar and the Settings card:
+    /// a tick only when the last pull/merge/push actually succeeded.
+    fn sync_state(&self) -> (&'static str, Color32, bool) {
+        if self.sync_status.mode.is_empty() || self.sync_status.mode == "off" {
+            ("Sync off", t::DIM_2, false)
+        } else if !self.sync_status.enabled {
+            ("Not connected", t::DIM, false)
+        } else if !self.sync_status.last_error.is_empty() {
+            ("Sync failed", t::DANGER, false)
+        } else if self.sync_status.last_at > 0 {
+            ("Synced", t::GOOD, true)
+        } else {
+            ("Ready to sync", t::DIM, false)
+        }
+    }
+
+    /// A tick when the last sync succeeded, a dot otherwise, so the state reads
+    /// at a glance instead of only as a sentence.
+    fn sync_state_icon(ui: &mut egui::Ui, tick: bool, color: Color32) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+        let painter = ui.painter();
+        if tick {
+            let point = |x: f32, y: f32| {
+                egui::pos2(
+                    rect.min.x + rect.width() * x,
+                    rect.min.y + rect.height() * y,
+                )
+            };
+            painter.line_segment(
+                [point(0.1, 0.55), point(0.42, 0.85)],
+                egui::Stroke::new(1.8, color),
+            );
+            painter.line_segment(
+                [point(0.42, 0.85), point(0.92, 0.18)],
+                egui::Stroke::new(1.8, color),
+            );
+        } else {
+            painter.circle_filled(rect.center(), 3.5, color);
+        }
     }
 
     /// Open the bundled rclone's setup wizard in a terminal. It asks for an
@@ -2534,6 +2615,71 @@ impl App {
                     }
                     response.on_hover_text(format!("Update to RustTube {}", release.version));
                 }
+
+                // Sync state at a glance, between the update notice (if any)
+                // and the sidebar toggle. Clicking opens the sync settings.
+                let (sync_label, sync_color, sync_tick) = self.sync_state();
+                let chip_right = if self.update.installable().is_some() { 144.0 } else { 40.0 };
+                let chip = Rect::from_min_size(
+                    egui::pos2(
+                        ui.max_rect().right() - chip_right - 118.0,
+                        ui.max_rect().center().y - 13.0,
+                    ),
+                    Vec2::new(118.0, 26.0),
+                );
+                let sync_chip = ui
+                    .interact(chip, ui.id().with("sync-chip"), Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if sync_chip.hovered() {
+                    ui.painter()
+                        .rect_filled(chip, CornerRadius::same(t::RADIUS), t::PANEL_2);
+                }
+                let icon = Rect::from_min_size(
+                    egui::pos2(chip.left() + 9.0, chip.center().y - 7.0),
+                    Vec2::splat(14.0),
+                );
+                if sync_tick {
+                    let point = |x: f32, y: f32| {
+                        egui::pos2(
+                            icon.min.x + icon.width() * x,
+                            icon.min.y + icon.height() * y,
+                        )
+                    };
+                    ui.painter().line_segment(
+                        [point(0.1, 0.55), point(0.42, 0.85)],
+                        egui::Stroke::new(1.8, sync_color),
+                    );
+                    ui.painter().line_segment(
+                        [point(0.42, 0.85), point(0.92, 0.18)],
+                        egui::Stroke::new(1.8, sync_color),
+                    );
+                } else {
+                    ui.painter().circle_filled(icon.center(), 3.5, sync_color);
+                }
+                ui.painter().text(
+                    egui::pos2(chip.left() + 29.0, chip.center().y),
+                    Align2::LEFT_CENTER,
+                    sync_label,
+                    t::semibold(11.0),
+                    sync_color,
+                );
+                if sync_chip.clicked() {
+                    self.navigate(Route::Settings);
+                }
+                let sync_hint = if !self.sync_status.last_error.is_empty() {
+                    self.sync_status.last_error.clone()
+                } else if self.sync_status.last_at > 0 {
+                    format!(
+                        "Synced {} · {}",
+                        t::format_relative(self.sync_status.last_at),
+                        self.sync_status.target
+                    )
+                } else if self.sync_status.enabled {
+                    format!("Ready to sync through {}", self.sync_status.target)
+                } else {
+                    "Open sync settings".to_string()
+                };
+                sync_chip.on_hover_text(sync_hint);
 
                 // Keep the toggle out of the centered navigation: reveal it
                 // only when the pointer enters the top-right corner zone.
@@ -5549,6 +5695,44 @@ impl App {
 
                     if self.settings.sync_mode == "rclone" {
                         ui.label(RichText::new("rclone remote").size(12.0).color(t::DIM));
+                        if !self.settings.rclone_remotes.is_empty() {
+                            let remotes = self.settings.rclone_remotes.clone();
+                            let current = self.settings.sync_rclone.clone();
+                            let mut chosen: Option<String> = None;
+                            ui.horizontal_wrapped(|ui| {
+                                for name in remotes {
+                                    let path = format!("{name}:RustTube");
+                                    let active = current == path;
+                                    let button = ui.add(
+                                        egui::Button::new(
+                                            RichText::new(&name).size(11.5).color(if active {
+                                                t::TEXT
+                                            } else {
+                                                t::DIM
+                                            }),
+                                        )
+                                        .fill(if active { t::PANEL_2 } else { Color32::TRANSPARENT })
+                                        .stroke(Stroke::new(
+                                            1.0_f32,
+                                            if active { t::ACCENT } else { t::LINE },
+                                        ))
+                                        .corner_radius(CornerRadius::same(t::RADIUS)),
+                                    );
+                                    if button
+                                        .on_hover_text(format!("Keep the snapshot in {path}"))
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        .clicked()
+                                    {
+                                        chosen = Some(path);
+                                    }
+                                }
+                            });
+                            if let Some(path) = chosen {
+                                self.settings.sync_rclone = path;
+                                self.save_settings();
+                                self.sync_now();
+                            }
+                        }
                         let width = ui.available_width();
                         ui.add(
                             egui::TextEdit::singleline(&mut self.settings.sync_rclone)
@@ -5567,6 +5751,17 @@ impl App {
                             if t::quiet_button(ui, "Set up in Terminal").clicked() {
                                 self.open_rclone_setup();
                             }
+                            if t::quiet_button(ui, "Refresh").clicked() {
+                                self.settings.rclone_ok = sync::rclone_works();
+                                self.settings.rclone_remotes = sync::rclone_remotes();
+                                if self.settings.sync_rclone.trim().is_empty()
+                                    && self.settings.rclone_remotes.len() == 1
+                                {
+                                    if let Some(name) = self.settings.rclone_remotes.first().cloned() {
+                                        self.settings.sync_rclone = format!("{name}:RustTube");
+                                    }
+                                }
+                            }
                             let binary = sync::rclone_binary();
                             ui.label(
                                 RichText::new(if self.settings.rclone_ok {
@@ -5584,11 +5779,8 @@ impl App {
                     ui.checkbox(&mut self.settings.sync_auto, "Sync automatically");
 
                     ui.add_space(6.0);
-                    let status = if self.sync_status.mode.is_empty() || self.sync_status.mode == "off" {
-                        "Sync is off — everything stays on this device.".to_string()
-                    } else if !self.sync_status.enabled {
-                        format!("Not ready — {}", self.sync_status.target)
-                    } else if !self.sync_status.last_error.is_empty() {
+                    let (state, color, tick) = self.sync_state();
+                    let detail = if !self.sync_status.last_error.is_empty() {
                         self.sync_status.last_error.clone()
                     } else if self.sync_status.last_at > 0 {
                         format!(
@@ -5596,16 +5788,18 @@ impl App {
                             t::format_relative(self.sync_status.last_at),
                             self.sync_status.target
                         )
+                    } else if self.sync_status.enabled {
+                        format!("Through {}", self.sync_status.target)
+                    } else if self.sync_status.mode.is_empty() || self.sync_status.mode == "off" {
+                        "Everything stays on this device.".to_string()
                     } else {
-                        format!("Ready to sync through {}", self.sync_status.target)
+                        self.sync_status.target.clone()
                     };
-                    ui.label(
-                        RichText::new(status).size(11.5).color(if self.sync_status.last_error.is_empty() {
-                            t::DIM_2
-                        } else {
-                            t::DANGER
-                        }),
-                    );
+                    ui.horizontal_wrapped(|ui| {
+                        Self::sync_state_icon(ui, tick, color);
+                        ui.label(RichText::new(state).size(11.5).strong().color(color));
+                        ui.label(RichText::new(detail).size(11.5).color(t::DIM_2));
+                    });
 
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {

@@ -539,6 +539,26 @@ pub fn rclone_works() -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// Remote names rclone already has configured, so Settings can offer them
+/// instead of asking the user to retype the name the wizard just chose.
+pub fn rclone_remotes() -> Vec<String> {
+    match rclone_command().arg("listremotes").output() {
+        Ok(output) if output.status.success() => {
+            parse_remotes(&String::from_utf8_lossy(&output.stdout))
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn parse_remotes(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|line| line.trim().strip_suffix(':'))
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn rclone_command() -> std::process::Command {
     let mut command = std::process::Command::new(rclone_binary());
     command.stdin(std::process::Stdio::null());
@@ -926,6 +946,15 @@ mod tests {
         assert_eq!(settings.enabled(), cloud_folder("gdrive").is_some());
         assert_eq!(cloud_label("gdrive"), "Google Drive");
         assert_eq!(cloud_label("unknown"), "a cloud folder");
+    }
+
+    #[test]
+    fn reads_rclone_remote_names() {
+        assert_eq!(
+            parse_remotes("mega:\nMegaRustTube:\n\n"),
+            vec!["mega".to_string(), "MegaRustTube".to_string()]
+        );
+        assert!(parse_remotes("").is_empty());
     }
 
     #[test]

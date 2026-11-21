@@ -34,6 +34,8 @@ pub const TEXT: Color32 = Color32::from_rgb(0xf2, 0xf4, 0xf6);
 pub const DIM: Color32 = Color32::from_rgb(0xa9, 0xb1, 0xbc);
 pub const DIM_2: Color32 = Color32::from_rgb(0x6e, 0x77, 0x84);
 pub const DANGER: Color32 = Color32::from_rgb(0xf5, 0x71, 0x7f);
+/// Healthy state: the sync tick.
+pub const GOOD: Color32 = Color32::from_rgb(0x5e, 0xd6, 0x8c);
 
 // ------------------------------------------------------------------- metrics
 
