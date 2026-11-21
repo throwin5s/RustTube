@@ -1775,6 +1775,65 @@ impl App {
         self.toast(format!("Using the rclone remote {name}:RustTube"));
     }
 
+    /// The top-bar chip: a tick after a successful merge, a dot when something
+    /// needs attention. Clicking it opens the sync settings.
+    fn sync_chip(&mut self, ui: &mut egui::Ui, chip: Rect) {
+        let (label, color, tick) = self.sync_state();
+        let response = ui
+            .interact(chip, ui.id().with("sync-chip"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if response.hovered() {
+            ui.painter()
+                .rect_filled(chip, CornerRadius::same(t::RADIUS), t::PANEL_2);
+        }
+        let icon = Rect::from_min_size(
+            egui::pos2(chip.left() + 9.0, chip.center().y - 7.0),
+            Vec2::splat(14.0),
+        );
+        if tick {
+            let point = |x: f32, y: f32| {
+                egui::pos2(
+                    icon.min.x + icon.width() * x,
+                    icon.min.y + icon.height() * y,
+                )
+            };
+            ui.painter().line_segment(
+                [point(0.1, 0.55), point(0.42, 0.85)],
+                egui::Stroke::new(1.8, color),
+            );
+            ui.painter().line_segment(
+                [point(0.42, 0.85), point(0.92, 0.18)],
+                egui::Stroke::new(1.8, color),
+            );
+        } else {
+            ui.painter().circle_filled(icon.center(), 3.5, color);
+        }
+        ui.painter().text(
+            egui::pos2(chip.left() + 29.0, chip.center().y),
+            Align2::LEFT_CENTER,
+            label,
+            t::semibold(11.0),
+            color,
+        );
+        if response.clicked() {
+            self.navigate(Route::Settings);
+        }
+        let hint = if !self.sync_status.last_error.is_empty() {
+            self.sync_status.last_error.clone()
+        } else if self.sync_status.last_at > 0 {
+            format!(
+                "Synced {} · {}",
+                t::format_relative(self.sync_status.last_at),
+                self.sync_status.target
+            )
+        } else if self.sync_status.enabled {
+            format!("Ready to sync through {}", self.sync_status.target)
+        } else {
+            "Open sync settings".to_string()
+        };
+        response.on_hover_text(hint);
+    }
+
     /// The one true sync state, shared by the top bar and the Settings card:
     /// a tick only when the last pull/merge/push actually succeeded.
     fn sync_state(&self) -> (&'static str, Color32, bool) {
@@ -2616,70 +2675,18 @@ impl App {
                     response.on_hover_text(format!("Update to RustTube {}", release.version));
                 }
 
-                // Sync state at a glance, between the update notice (if any)
-                // and the sidebar toggle. Clicking opens the sync settings.
-                let (sync_label, sync_color, sync_tick) = self.sync_state();
-                let chip_right = if self.update.installable().is_some() { 144.0 } else { 40.0 };
-                let chip = Rect::from_min_size(
-                    egui::pos2(
-                        ui.max_rect().right() - chip_right - 118.0,
-                        ui.max_rect().center().y - 13.0,
-                    ),
-                    Vec2::new(118.0, 26.0),
-                );
-                let sync_chip = ui
-                    .interact(chip, ui.id().with("sync-chip"), Sense::click())
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                if sync_chip.hovered() {
-                    ui.painter()
-                        .rect_filled(chip, CornerRadius::same(t::RADIUS), t::PANEL_2);
-                }
-                let icon = Rect::from_min_size(
-                    egui::pos2(chip.left() + 9.0, chip.center().y - 7.0),
-                    Vec2::splat(14.0),
-                );
-                if sync_tick {
-                    let point = |x: f32, y: f32| {
+                // The update pill owns this corner when there is one, so the
+                // sync chip only draws when it cannot collide with it.
+                if self.update.installable().is_none() {
+                    let chip = Rect::from_min_size(
                         egui::pos2(
-                            icon.min.x + icon.width() * x,
-                            icon.min.y + icon.height() * y,
-                        )
-                    };
-                    ui.painter().line_segment(
-                        [point(0.1, 0.55), point(0.42, 0.85)],
-                        egui::Stroke::new(1.8, sync_color),
+                            ui.max_rect().right() - 158.0,
+                            ui.max_rect().center().y - 13.0,
+                        ),
+                        Vec2::new(118.0, 26.0),
                     );
-                    ui.painter().line_segment(
-                        [point(0.42, 0.85), point(0.92, 0.18)],
-                        egui::Stroke::new(1.8, sync_color),
-                    );
-                } else {
-                    ui.painter().circle_filled(icon.center(), 3.5, sync_color);
+                    self.sync_chip(ui, chip);
                 }
-                ui.painter().text(
-                    egui::pos2(chip.left() + 29.0, chip.center().y),
-                    Align2::LEFT_CENTER,
-                    sync_label,
-                    t::semibold(11.0),
-                    sync_color,
-                );
-                if sync_chip.clicked() {
-                    self.navigate(Route::Settings);
-                }
-                let sync_hint = if !self.sync_status.last_error.is_empty() {
-                    self.sync_status.last_error.clone()
-                } else if self.sync_status.last_at > 0 {
-                    format!(
-                        "Synced {} · {}",
-                        t::format_relative(self.sync_status.last_at),
-                        self.sync_status.target
-                    )
-                } else if self.sync_status.enabled {
-                    format!("Ready to sync through {}", self.sync_status.target)
-                } else {
-                    "Open sync settings".to_string()
-                };
-                sync_chip.on_hover_text(sync_hint);
 
                 // Keep the toggle out of the centered navigation: reveal it
                 // only when the pointer enters the top-right corner zone.
