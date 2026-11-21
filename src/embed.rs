@@ -12,8 +12,9 @@ use eframe::glow::{self, HasContext};
 use egui_glow::CallbackFn;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 // --------------------------------------------------------------------- FFI
 
@@ -209,6 +210,108 @@ pub struct NowPlaying {
     pub duration_hint: i64,
 }
 
+/// The media mpv was last asked to play, kept so a stalled picture can be
+/// reopened at the same spot instead of leaving a frozen frame on screen.
+#[derive(Clone)]
+struct Media {
+    video: String,
+    audio: Option<String>,
+    video_id: String,
+}
+
+/// How long the clock may advance without a new video frame before the picture
+/// counts as stuck, and how long to wait before reopening the stream again when
+/// the first attempt did not help.
+const STALL_AFTER: Duration = Duration::from_secs(5);
+const STALL_COOLDOWN: Duration = Duration::from_secs(30);
+/// Reopenings per loaded file. A stream that keeps stalling after each clean
+/// restart is not coming back, and audio alone beats restarting forever.
+const STALL_RETRIES: u32 = 3;
+
+#[derive(Clone, Copy, Debug)]
+struct PictureSample {
+    /// Composites of the video quad, used to tell a picture the user can see
+    /// from one that is scrolled out of view.
+    paints: u64,
+    /// Frames mpv actually handed over for rendering.
+    frames: u64,
+    position: f64,
+    playing: bool,
+}
+
+/// Detects the failure mpv emits no event for: the audio track keeps playing
+/// while the video demuxer stops delivering frames, which is what a failed HLS
+/// segment looks like. Seeking does not recover from it -- ffmpeg has already
+/// given up on the video stream -- so the file has to be reopened.
+struct StallWatch {
+    paints: u64,
+    frames: u64,
+    position: f64,
+    since: Instant,
+    recovered: Option<Instant>,
+    attempts: u32,
+}
+
+impl StallWatch {
+    fn new(now: Instant) -> Self {
+        Self {
+            paints: 0,
+            frames: 0,
+            position: 0.0,
+            since: now,
+            recovered: None,
+            attempts: 0,
+        }
+    }
+
+    /// True when the picture has stopped while playback continues, so the
+    /// stream should be reopened.
+    fn stalled(
+        &mut self,
+        now: Instant,
+        sample: PictureSample,
+        after: Duration,
+        cooldown: Duration,
+    ) -> bool {
+        let visible = sample.paints != self.paints;
+        self.paints = sample.paints;
+
+        let fresh_frame = sample.frames != self.frames;
+        let advancing = sample.position > self.position + 0.001;
+        self.position = sample.position;
+
+        if fresh_frame {
+            self.frames = sample.frames;
+            self.since = now;
+            return false;
+        }
+        // A hidden picture, a paused player and a clock that is not moving are
+        // all good reasons for no new frames, and none of them is a stall.
+        if !visible || !sample.playing || !advancing {
+            self.since = now;
+            return false;
+        }
+        if now.saturating_duration_since(self.since) < after {
+            return false;
+        }
+        if self
+            .recovered
+            .is_some_and(|at| now.saturating_duration_since(at) < cooldown)
+        {
+            self.since = now;
+            return false;
+        }
+        if self.attempts >= STALL_RETRIES {
+            self.since = now;
+            return false;
+        }
+        self.attempts += 1;
+        self.recovered = Some(now);
+        self.since = now;
+        true
+    }
+}
+
 // ------------------------------------------------------------------- state
 
 #[derive(Default)]
@@ -243,6 +346,15 @@ struct Inner {
     fallback: Mutex<Option<String>>,
     error: Mutex<Option<String>>,
     ctx: egui::Context,
+    /// Debounce for the picture-stall detector, which mpv itself cannot report.
+    paints: AtomicU64,
+    frames: AtomicU64,
+    /// Frame count when the current file was loaded; a file that never produced
+    /// a picture has no frozen frame to recover from.
+    frame_floor: AtomicU64,
+    stall: Mutex<StallWatch>,
+    media: Mutex<Option<Media>>,
+    preview: bool,
 }
 
 unsafe impl Send for Inner {}
@@ -359,6 +471,19 @@ impl Player {
         if let Ok(mut snapshot) = inner.snapshot.lock() {
             *snapshot = Snapshot::default();
         }
+        if let Ok(mut media) = inner.media.lock() {
+            *media = Some(Media {
+                video: video.to_string(),
+                audio: audio.map(str::to_string),
+                video_id: video_id.to_string(),
+            });
+        }
+        inner
+            .frame_floor
+            .store(inner.frames.load(Ordering::Relaxed), Ordering::Relaxed);
+        if let Ok(mut watch) = inner.stall.lock() {
+            *watch = StallWatch::new(Instant::now());
+        }
         if let Ok(mut resume) = inner.resume.lock() {
             *resume = if start_at >= 5.0 { Some(start_at) } else { None };
         }
@@ -432,6 +557,12 @@ impl Player {
             if let Ok(mut snapshot) = inner.snapshot.lock() {
                 *snapshot = Snapshot::default();
             }
+            if let Ok(mut media) = inner.media.lock() {
+                *media = None;
+            }
+            if let Ok(mut watch) = inner.stall.lock() {
+                *watch = StallWatch::new(Instant::now());
+            }
         }
     }
 
@@ -491,6 +622,12 @@ impl Inner {
             fallback: Mutex::new(None),
             error: Mutex::new(None),
             ctx,
+            paints: AtomicU64::new(0),
+            frames: AtomicU64::new(0),
+            frame_floor: AtomicU64::new(0),
+            stall: Mutex::new(StallWatch::new(Instant::now())),
+            media: Mutex::new(None),
+            preview,
         });
         inner.set_option("vo", "libmpv");
         if cfg!(target_os = "windows") {
@@ -613,7 +750,61 @@ impl Inner {
                 _ => {}
             }
             self.ctx.request_repaint();
+            self.check_stall();
         }
+    }
+
+    /// Watch for the one failure mpv reports no event for: the clock keeps
+    /// running (the separately added audio track is fine) but no new video
+    /// frames arrive, so the last frame stays on screen forever.
+    fn check_stall(&self) {
+        if self.preview {
+            return;
+        }
+        let Ok(snapshot) = self.snapshot.lock().map(|snapshot| *snapshot) else {
+            return;
+        };
+        let frames = self.frames.load(Ordering::Relaxed);
+        if frames <= self.frame_floor.load(Ordering::Relaxed) {
+            return;
+        }
+        let sample = PictureSample {
+            paints: self.paints.load(Ordering::Relaxed),
+            frames,
+            position: snapshot.position,
+            playing: snapshot.started && !snapshot.paused,
+        };
+        let Ok(mut watch) = self.stall.lock() else {
+            return;
+        };
+        let stalled = watch.stalled(Instant::now(), sample, STALL_AFTER, STALL_COOLDOWN);
+        drop(watch);
+        if stalled {
+            self.recover_picture(snapshot.position);
+        }
+    }
+
+    /// Reopen the current stream where the picture stopped. A seek is not
+    /// enough: after a failed segment the HLS demuxer no longer returns video
+    /// packets, and only a fresh file restores it.
+    fn recover_picture(&self, position: f64) {
+        let Some(media) = self.media.lock().ok().and_then(|media| (*media).clone()) else {
+            return;
+        };
+        eprintln!("embed: picture stalled at {position:.1}s, reopening the stream");
+        if let Ok(mut resume) = self.resume.lock() {
+            *resume = Some(position.max(0.0));
+        }
+        if let Ok(mut audio) = self.pending_audio.lock() {
+            *audio = media.audio.clone();
+        }
+        if let Ok(mut fallback) = self.fallback.lock() {
+            *fallback = Some(format!(
+                "https://www.youtube.com/watch?v={}",
+                media.video_id
+            ));
+        }
+        self.command(&["loadfile", &media.video, "replace"]);
     }
 
     fn on_property(&self, name: &str, property: &MpvEventProperty) {
@@ -688,9 +879,10 @@ impl Inner {
 
         // Do not composite an empty FBO: before the first decoded frame it is
         // black, which is what made hover previews flash black over the poster.
-        if !self.frame_ready.load(Ordering::Relaxed)
-            && unsafe { mpv_render_context_update(state.ctx) } & 1 == 0
-        {
+        // `update` also says whether this render consumes a new frame; the
+        // stall detector counts those to tell a frozen picture from a live one.
+        let fresh = unsafe { mpv_render_context_update(state.ctx) } & 1 != 0;
+        if !fresh && !self.frame_ready.load(Ordering::Relaxed) {
             return;
         }
 
@@ -730,6 +922,9 @@ impl Inner {
                 eprintln!("embed: mpv render failed ({rc})");
             } else {
                 self.frame_ready.store(true, Ordering::Relaxed);
+                if fresh {
+                    self.frames.fetch_add(1, Ordering::Relaxed);
+                }
             }
             mpv_render_context_report_swap(state.ctx);
 
@@ -773,6 +968,7 @@ impl Inner {
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.bind_vertex_array(None);
         }
+        self.paints.fetch_add(1, Ordering::Relaxed);
     }
 
     fn set_update_callback(&self, ctx: RenderCtx) {
@@ -993,5 +1189,124 @@ unsafe fn compile_program(gl: &glow::Context) -> Option<glow::Program> {
         eprintln!("embed: program link failed: {}", gl.get_program_info_log(program));
         gl.delete_program(program);
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(paints: u64, frames: u64, position: f64) -> PictureSample {
+        PictureSample {
+            paints,
+            frames,
+            position,
+            playing: true,
+        }
+    }
+
+    #[test]
+    fn stall_watch_notices_a_frozen_picture_while_the_clock_runs() {
+        let start = Instant::now();
+        let after = Duration::from_millis(50);
+        let cooldown = Duration::from_secs(30);
+        let mut watch = StallWatch::new(start);
+
+        assert!(!watch.stalled(start, sample(1, 4, 10.0), after, cooldown));
+        assert!(!watch.stalled(
+            start + Duration::from_millis(20),
+            sample(2, 4, 10.4),
+            after,
+            cooldown
+        ));
+        assert!(
+            watch.stalled(
+                start + Duration::from_millis(80),
+                sample(3, 4, 11.0),
+                after,
+                cooldown
+            ),
+            "an advancing clock with no new frames is a stalled picture"
+        );
+    }
+
+    #[test]
+    fn stall_watch_ignores_new_frames_pauses_and_hidden_pictures() {
+        let start = Instant::now();
+        let after = Duration::from_millis(50);
+        let cooldown = Duration::from_secs(30);
+        let mut watch = StallWatch::new(start);
+        watch.stalled(start, sample(1, 1, 5.0), after, cooldown);
+
+        // A new frame arrived: the picture is alive.
+        assert!(!watch.stalled(
+            start + Duration::from_millis(60),
+            sample(2, 2, 5.6),
+            after,
+            cooldown
+        ));
+        // Paused: no frames and no advancing clock is not a stall.
+        assert!(!watch.stalled(
+            start + Duration::from_millis(120),
+            PictureSample {
+                playing: false,
+                ..sample(3, 2, 5.6)
+            },
+            after,
+            cooldown
+        ));
+        // Scrolled out of view: nothing is painted, so nothing can be stuck.
+        assert!(!watch.stalled(
+            start + Duration::from_millis(180),
+            sample(3, 2, 6.2),
+            after,
+            cooldown
+        ));
+    }
+
+    #[test]
+    fn stall_watch_waits_between_recoveries() {
+        let start = Instant::now();
+        let after = Duration::ZERO;
+        let cooldown = Duration::from_secs(3);
+        let mut watch = StallWatch::new(start);
+        watch.stalled(start, sample(1, 5, 20.0), after, cooldown);
+
+        assert!(watch.stalled(
+            start + Duration::from_millis(10),
+            sample(2, 5, 20.2),
+            after,
+            cooldown
+        ));
+        assert!(
+            !watch.stalled(
+                start + Duration::from_millis(20),
+                sample(3, 5, 20.4),
+                after,
+                cooldown
+            ),
+            "a second reload inside the cooldown would loop on the same segment"
+        );
+        assert!(watch.stalled(
+            start + Duration::from_secs(4),
+            sample(4, 5, 24.0),
+            after,
+            cooldown
+        ));
+    }
+
+    #[test]
+    fn stall_watch_stops_retrying_a_stream_that_never_recovers() {
+        let start = Instant::now();
+        let mut watch = StallWatch::new(start);
+        let mut reloads = 0;
+        for step in 0..8u64 {
+            let at = start + Duration::from_secs(step);
+            let sample = sample(step + 1, 1, 10.0 + step as f64);
+            if watch.stalled(at, sample, Duration::ZERO, Duration::ZERO) {
+                reloads += 1;
+            }
+        }
+        assert_eq!(reloads, STALL_RETRIES);
     }
 }
