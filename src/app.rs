@@ -5366,7 +5366,7 @@ impl App {
                         if clouds.is_empty() {
                             ui.label(
                                 RichText::new(
-                                    "No cloud client found. Install and sign in to Google Drive, OneDrive, iCloud Drive, Dropbox, pCloud or Box, then reopen this page.",
+                                    "No cloud client found. Install and sign in to Google Drive, OneDrive, iCloud Drive, Dropbox, Box, Proton Drive, Nextcloud, MEGA or another supported client, then reopen this page.",
                                 )
                                 .size(11.8)
                                 .color(t::DIM_2),

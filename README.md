@@ -207,7 +207,8 @@ client moves the file; RustTube only merges it. There is no RustTube account and
 no server in between.
 
 Pick **Cloud account** and RustTube lists the clients it finds signed in on this
-machine: **Google Drive, OneDrive, iCloud Drive, Dropbox, pCloud and Box**. It
+machine: **Google Drive, OneDrive, iCloud Drive, Dropbox, Box, pCloud, Proton
+Drive, Nextcloud, MEGA, Tresorit, Yandex Disk, Jottacloud and Koofr**. It
 never asks for a password — signing in to the provider's desktop app is the whole
 setup — and it stores the *provider*, not a path, so the same choice means
 `RustTube/rusttube-sync.json` inside that account on macOS and Windows alike.

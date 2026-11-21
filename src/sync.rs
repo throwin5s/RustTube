@@ -1,8 +1,9 @@
 //! Cross-device synchronisation.
 //!
 //! RustTube stores one JSON snapshot in the storage you already have: the folder
-//! a cloud client (iCloud Drive, Google Drive, OneDrive, Dropbox, pCloud, Box)
-//! keeps in sync, any other synced folder, or a WebDAV server. There is no
+//! a cloud client (Google Drive, OneDrive, iCloud Drive, Dropbox, Box, Proton
+//! Drive, Nextcloud, MEGA and more) keeps in sync, any other synced folder, or
+//! a WebDAV server. There is no
 //! RustTube account and no server of ours in the middle.
 //!
 //! Cloud mode stores the *provider*, not a path, so the same setup means the
@@ -175,16 +176,70 @@ fn cloud_folder_in(
         .map(|(_, _, path)| path.join(CLOUD_SUBFOLDER))
 }
 
+/// A cloud client RustTube can find without being asked for a path. Signing in
+/// to its desktop app is the whole setup; the snapshot then lives in a
+/// `RustTube` folder inside the mount.
+struct Provider {
+    key: &'static str,
+    label: &'static str,
+    /// Folders under the home directory, in order of preference. A Windows
+    /// profile and a macOS home directory use the same names.
+    folders: &'static [&'static str],
+    /// Folder-name prefixes of the File Provider mounts macOS keeps in
+    /// `~/Library/CloudStorage`, one directory per signed-in account.
+    mounts: &'static [&'static str],
+}
+
+/// Ordered the way the picker shows them: the clients most people already run
+/// first, then the rest. These keys are stored in settings, so they stay put.
+const PROVIDERS: &[Provider] = &[
+    Provider { key: "gdrive", label: "Google Drive", folders: &["Google Drive"], mounts: &["GoogleDrive-"] },
+    Provider { key: "onedrive", label: "OneDrive", folders: &["OneDrive"], mounts: &["OneDrive-"] },
+    Provider {
+        key: "icloud",
+        label: "iCloud Drive",
+        folders: &["Library/Mobile Documents/com~apple~CloudDocs", "iCloudDrive"],
+        mounts: &[],
+    },
+    Provider { key: "dropbox", label: "Dropbox", folders: &["Dropbox"], mounts: &["Dropbox"] },
+    Provider { key: "pcloud", label: "pCloud", folders: &["pCloud Drive"], mounts: &[] },
+    Provider { key: "box", label: "Box", folders: &["Box"], mounts: &["Box-"] },
+    Provider {
+        key: "proton",
+        label: "Proton Drive",
+        folders: &["Proton Drive"],
+        mounts: &["ProtonDrive-"],
+    },
+    Provider {
+        key: "nextcloud",
+        label: "Nextcloud",
+        folders: &["Nextcloud"],
+        mounts: &["Nextcloud-"],
+    },
+    Provider {
+        key: "mega",
+        label: "MEGA",
+        // Current MEGAsync defaults; older builds sync into Documents.
+        folders: &["MEGA", "Documents/MEGAsync", "Documents/MEGA"],
+        mounts: &[],
+    },
+    Provider { key: "tresorit", label: "Tresorit", folders: &["Tresorit"], mounts: &["Tresorit"] },
+    Provider {
+        key: "yandex",
+        label: "Yandex Disk",
+        folders: &["Yandex.Disk", "YandexDisk"],
+        mounts: &[],
+    },
+    Provider { key: "jottacloud", label: "Jottacloud", folders: &["Jottacloud"], mounts: &[] },
+    Provider { key: "koofr", label: "Koofr", folders: &["Desktop/Koofr"], mounts: &[] },
+];
+
+fn provider(key: &str) -> Option<&'static Provider> {
+    PROVIDERS.iter().find(|provider| provider.key == key)
+}
+
 pub fn cloud_label(key: &str) -> &'static str {
-    match key {
-        "gdrive" => "Google Drive",
-        "onedrive" => "OneDrive",
-        "icloud" => "iCloud Drive",
-        "dropbox" => "Dropbox",
-        "pcloud" => "pCloud",
-        "box" => "Box",
-        _ => "a cloud folder",
-    }
+    provider(key).map_or("a cloud folder", |found| found.label)
 }
 
 pub fn presets() -> Vec<SyncPreset> {
@@ -216,31 +271,45 @@ fn discover(
 
     let mut found: Vec<(&'static str, &'static str, PathBuf)> = Vec::new();
 
-    // iCloud Drive (macOS), iCloud for Windows.
-    add(&mut found, "icloud", "iCloud Drive", home.join("Library/Mobile Documents/com~apple~CloudDocs"));
-    add(&mut found, "icloud", "iCloud Drive", home.join("iCloudDrive"));
-    // Dropbox and the older OneDrive/Google Drive locations.
-    add(&mut found, "dropbox", "Dropbox", home.join("Dropbox"));
+    // File Provider mounts are where current macOS clients keep their files, so
+    // they win over the older folders in the home directory. A provider can
+    // have several mounts: one per account, plus leftovers macOS keeps after a
+    // sign-out with a date suffix, and the shortest name is the live one.
+    let mut mounts = child_dirs(&home.join("Library/CloudStorage"));
+    mounts.sort_by_key(|mount| {
+        let name = mount.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+        (name.len(), name.to_string())
+    });
+    for provider in PROVIDERS {
+        let mount = mounts.iter().find(|mount| {
+            mount
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| provider.mounts.iter().any(|prefix| name.starts_with(prefix)))
+        });
+        let Some(mount) = mount else {
+            continue;
+        };
+        // Google Drive keeps the files in "My Drive" inside the account folder.
+        let path = if provider.key == "gdrive" {
+            mount.join("My Drive")
+        } else {
+            mount.to_path_buf()
+        };
+        add(&mut found, provider.key, provider.label, path);
+    }
+
+    // The environment variable names the OneDrive folder a user or an
+    // administrator picked, which need not be the default one.
     if let Some(path) = onedrive {
         add(&mut found, "onedrive", "OneDrive", path.to_path_buf());
     }
-    add(&mut found, "onedrive", "OneDrive", home.join("OneDrive"));
-    add(&mut found, "gdrive", "Google Drive", home.join("Google Drive"));
-    add(&mut found, "pcloud", "pCloud", home.join("pCloud Drive"));
-    add(&mut found, "box", "Box", home.join("Box"));
 
-    // Google Drive, OneDrive and Box for desktop each mount an account under
-    // ~/Library/CloudStorage on macOS.
-    for mount in child_dirs(&home.join("Library/CloudStorage")) {
-        let Some(name) = mount.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if name.starts_with("GoogleDrive-") {
-            add(&mut found, "gdrive", "Google Drive", mount.join("My Drive"));
-        } else if name.starts_with("OneDrive-") {
-            add(&mut found, "onedrive", "OneDrive", mount);
-        } else if name.starts_with("Box-") {
-            add(&mut found, "box", "Box", mount);
+    // Older clients sync into the home directory itself (the Windows profile or
+    // the macOS home); iCloud keeps its drive a little deeper.
+    for provider in PROVIDERS {
+        for folder in provider.folders {
+            add(&mut found, provider.key, provider.label, home.join(folder));
         }
     }
 
@@ -255,13 +324,11 @@ fn discover(
     }
 
     // Stable order for the picker, independent of which path found the mount.
-    found.sort_by_key(|(key, _, _)| match *key {
-        "gdrive" => 0,
-        "onedrive" => 1,
-        "icloud" => 2,
-        "dropbox" => 3,
-        "pcloud" => 4,
-        _ => 5,
+    found.sort_by_key(|(key, _, _)| {
+        PROVIDERS
+            .iter()
+            .position(|provider| provider.key == *key)
+            .unwrap_or(usize::MAX)
     });
     found
 }
@@ -617,6 +684,48 @@ mod tests {
 
         // A provider that is not installed is simply absent, not an error.
         assert!(!keys.contains(&"onedrive"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn finds_the_newer_cloud_clients_too() {
+        let home = std::env::temp_dir().join(format!("rusttube-home-{}", uuid::Uuid::new_v4()));
+        for folder in [
+            "MEGA",
+            "Nextcloud",
+            "Yandex.Disk",
+            "Jottacloud",
+            "Desktop/Koofr",
+            "Library/CloudStorage/Dropbox",
+            "Library/CloudStorage/ProtonDrive-me@example.com",
+        ] {
+            std::fs::create_dir_all(home.join(folder)).expect("cloud folder");
+        }
+
+        let found = discover(&home, None);
+        let keys: Vec<&str> = found.iter().map(|(key, _, _)| *key).collect();
+        assert_eq!(
+            keys,
+            vec!["dropbox", "proton", "nextcloud", "mega", "yandex", "jottacloud", "koofr"]
+        );
+        assert_eq!(cloud_label("proton"), "Proton Drive");
+        assert_eq!(cloud_label("mega"), "MEGA");
+        assert_eq!(cloud_label("tresorit"), "Tresorit");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn prefers_the_live_mount_over_a_signed_out_leftover() {
+        let home = std::env::temp_dir().join(format!("rusttube-home-{}", uuid::Uuid::new_v4()));
+        let live = home.join("Library/CloudStorage/ProtonDrive-me@example.com");
+        let leftover =
+            home.join("Library/CloudStorage/ProtonDrive-me@example.com (22-04-2024 13/57)");
+        std::fs::create_dir_all(&live).expect("live mount");
+        std::fs::create_dir_all(&leftover).expect("leftover mount");
+
+        let found = discover(&home, None);
+        let proton = found.iter().find(|(key, _, _)| *key == "proton");
+        assert_eq!(proton.map(|(_, _, path)| path), Some(&live));
         std::fs::remove_dir_all(&home).ok();
     }
 
