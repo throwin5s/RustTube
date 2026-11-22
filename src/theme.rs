@@ -19,23 +19,48 @@ use std::time::Duration;
 
 // ------------------------------------------------------------------- palette
 
-pub const ACCENT: Color32 = Color32::from_rgb(0xf2, 0x3b, 0x33);
+// All painting happens on the UI thread, including custom-painted controls.
+#[derive(Clone, Copy, Default, PartialEq)]
+pub enum Appearance { #[default] RustTube, Oled, YouTube }
+
+thread_local! { static APPEARANCE: std::cell::Cell<Appearance> = const { std::cell::Cell::new(Appearance::RustTube) }; }
+
+impl Appearance {
+    pub fn key(self) -> &'static str { match self { Self::RustTube => "rusttube", Self::Oled => "oled", Self::YouTube => "youtube" } }
+    pub fn label(self) -> &'static str { match self { Self::RustTube => "RustTube", Self::Oled => "OLED black", Self::YouTube => "YouTube dark" } }
+    pub fn load(key: &str) -> Self { match key { "oled" => Self::Oled, "youtube" => Self::YouTube, _ => Self::RustTube } }
+    pub fn apply(self, ctx: &egui::Context) {
+        APPEARANCE.set(self);
+        ctx.set_visuals(visuals());
+        ctx.request_repaint();
+    }
+}
+
+macro_rules! tone {
+    ($name:ident, $default:expr, $oled:expr, $youtube:expr) => {
+        pub fn $name() -> Color32 {
+            let rgb: u32 = match APPEARANCE.get() { Appearance::RustTube => $default, Appearance::Oled => $oled, Appearance::YouTube => $youtube };
+            Color32::from_rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
+        }
+    };
+}
+tone!(accent, 0xf23b33, 0xf23b33, 0xff0033);
 pub const ACCENT_SOFT: Color32 = Color32::from_rgb(0xff, 0x74, 0x66);
 pub const ON_ACCENT: Color32 = Color32::from_rgb(0x16, 0x08, 0x07);
 
 /// Window behind everything.
-pub const BG: Color32 = Color32::from_rgb(0x0f, 0x11, 0x14);
+tone!(bg, 0x0f1114, 0x000000, 0x0f0f0f);
 /// Sidebar, player bar, dialogs.
-pub const PANEL: Color32 = Color32::from_rgb(0x15, 0x18, 0x1c);
+tone!(panel, 0x15181c, 0x000000, 0x0f0f0f);
 /// Cards, inputs, chips.
-pub const PANEL_2: Color32 = Color32::from_rgb(0x1d, 0x21, 0x27);
+tone!(panel_2, 0x1d2127, 0x0c0c0c, 0x212121);
 /// Hover / selected.
-pub const PANEL_3: Color32 = Color32::from_rgb(0x26, 0x2b, 0x33);
-pub const SURFACE_ACTIVE: Color32 = Color32::from_rgb(0x2f, 0x35, 0x3f);
-pub const LINE: Color32 = Color32::from_rgb(0x2a, 0x30, 0x38);
-pub const TEXT: Color32 = Color32::from_rgb(0xf2, 0xf4, 0xf6);
-pub const DIM: Color32 = Color32::from_rgb(0xa9, 0xb1, 0xbc);
-pub const DIM_2: Color32 = Color32::from_rgb(0x6e, 0x77, 0x84);
+tone!(panel_3, 0x262b33, 0x191919, 0x303030);
+tone!(surface_active, 0x2f353f, 0x272727, 0x3f3f3f);
+tone!(line, 0x2a3038, 0x282828, 0x383838);
+tone!(text, 0xf2f4f6, 0xf5f5f5, 0xf1f1f1);
+tone!(dim, 0xa9b1bc, 0xababab, 0xaaaaaa);
+tone!(dim_2, 0x6e7784, 0x888888, 0x909090);
 pub const DANGER: Color32 = Color32::from_rgb(0xf5, 0x71, 0x7f);
 /// Healthy state: the sync tick.
 pub const GOOD: Color32 = Color32::from_rgb(0x5e, 0xd6, 0x8c);
@@ -191,13 +216,13 @@ fn set_scrollbar_opacity(scroll: &mut egui::style::ScrollStyle, alpha: f32) {
 
 fn visuals() -> egui::Visuals {
     let mut v = egui::Visuals::dark();
-    v.panel_fill = PANEL;
-    v.window_fill = PANEL_3;
-    v.extreme_bg_color = PANEL_2;
-    v.faint_bg_color = PANEL_2;
-    v.override_text_color = Some(TEXT);
-    v.selection.bg_fill = ACCENT.gamma_multiply(0.35);
-    v.selection.stroke = Stroke::new(1.0_f32, ACCENT);
+    v.panel_fill = panel();
+    v.window_fill = panel_3();
+    v.extreme_bg_color = panel_2();
+    v.faint_bg_color = panel_2();
+    v.override_text_color = Some(text());
+    v.selection.bg_fill = accent().gamma_multiply(0.35);
+    v.selection.stroke = Stroke::new(1.0_f32, accent());
 
     let radius = CornerRadius::same(RADIUS);
     for widget in [
@@ -208,21 +233,21 @@ fn visuals() -> egui::Visuals {
     ] {
         widget.corner_radius = radius;
         widget.bg_stroke = Stroke::NONE;
-        widget.fg_stroke = Stroke::new(1.0_f32, TEXT);
+        widget.fg_stroke = Stroke::new(1.0_f32, text());
         widget.expansion = 0.0;
     }
     v.widgets.noninteractive.corner_radius = radius;
-    v.widgets.noninteractive.bg_fill = PANEL;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, LINE);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT);
-    v.widgets.inactive.bg_fill = PANEL_2;
-    v.widgets.inactive.weak_bg_fill = PANEL_2;
-    v.widgets.hovered.bg_fill = PANEL_3;
-    v.widgets.hovered.weak_bg_fill = PANEL_3;
-    v.widgets.active.bg_fill = SURFACE_ACTIVE;
-    v.widgets.active.weak_bg_fill = SURFACE_ACTIVE;
-    v.widgets.open.bg_fill = PANEL_3;
-    v.widgets.open.weak_bg_fill = PANEL_3;
+    v.widgets.noninteractive.bg_fill = panel();
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, line());
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, text());
+    v.widgets.inactive.bg_fill = panel_2();
+    v.widgets.inactive.weak_bg_fill = panel_2();
+    v.widgets.hovered.bg_fill = panel_3();
+    v.widgets.hovered.weak_bg_fill = panel_3();
+    v.widgets.active.bg_fill = surface_active();
+    v.widgets.active.weak_bg_fill = surface_active();
+    v.widgets.open.bg_fill = panel_3();
+    v.widgets.open.weak_bg_fill = panel_3();
 
     v.window_corner_radius = CornerRadius::same(RADIUS);
     v.menu_corner_radius = CornerRadius::same(RADIUS);
@@ -232,31 +257,31 @@ fn visuals() -> egui::Visuals {
 // -------------------------------------------------------------------- blocks
 
 pub fn h1(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).font(bold(22.0)).color(TEXT));
+    ui.label(RichText::new(text).font(bold(22.0)).color(self::text()));
 }
 
 pub fn sub(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).font(regular(13.0)).color(DIM));
+    ui.label(RichText::new(text).font(regular(13.0)).color(dim()));
 }
 
 /// Sentence-case section heading, as Spotifast titles its rows.
 pub fn section(ui: &mut Ui, text: &str) {
     ui.add_space(8.0);
-    ui.label(RichText::new(text).font(bold(17.0)).color(TEXT));
+    ui.label(RichText::new(text).font(bold(17.0)).color(self::text()));
     ui.add_space(4.0);
 }
 
 pub fn panel_frame() -> egui::Frame {
     egui::Frame::NONE
-        .fill(PANEL)
-        .stroke(Stroke::new(1.0_f32, LINE))
+        .fill(panel())
+        .stroke(Stroke::new(1.0_f32, line()))
         .corner_radius(CornerRadius::same(RADIUS))
         .inner_margin(Margin::same(16))
 }
 
 pub fn card_frame() -> egui::Frame {
     egui::Frame::NONE
-        .fill(PANEL_2)
+        .fill(panel_2())
         .stroke(Stroke::NONE)
         .corner_radius(CornerRadius::same(RADIUS))
         .inner_margin(Margin::symmetric(16, 14))
@@ -267,7 +292,7 @@ pub fn card_frame() -> egui::Frame {
 pub fn accent_button(ui: &mut Ui, label: &str) -> Response {
     ui.add(
         egui::Button::new(RichText::new(label).font(semibold(13.0)).color(ON_ACCENT))
-            .fill(ACCENT)
+            .fill(accent())
             .stroke(Stroke::NONE)
             .corner_radius(CornerRadius::same(RADIUS)),
     )
@@ -277,9 +302,9 @@ pub fn accent_button(ui: &mut Ui, label: &str) -> Response {
 /// Outlined button, the secondary action beside an accent one.
 pub fn quiet_button(ui: &mut Ui, label: &str) -> Response {
     ui.add(
-        egui::Button::new(RichText::new(label).font(medium(13.0)).color(TEXT))
+        egui::Button::new(RichText::new(label).font(medium(13.0)).color(text()))
             .fill(Color32::TRANSPARENT)
-            .stroke(Stroke::new(1.0_f32, LINE))
+            .stroke(Stroke::new(1.0_f32, line()))
             .corner_radius(CornerRadius::same(RADIUS)),
     )
     .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -305,7 +330,7 @@ pub fn nav_row(ui: &mut Ui, label: &str, active: bool) -> Response {
         ui.painter().rect_filled(
             rect,
             CornerRadius::same(RADIUS),
-            if active { PANEL_3 } else { PANEL_2 },
+            if active { panel_3() } else { panel_2() },
         );
     }
     ui.painter().text(
@@ -317,7 +342,7 @@ pub fn nav_row(ui: &mut Ui, label: &str, active: bool) -> Response {
         } else {
             medium(13.5)
         },
-        if active || hovered { TEXT } else { DIM },
+        if active || hovered { text() } else { dim() },
     );
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -627,7 +652,7 @@ pub fn player_primary_button(ui: &mut Ui, icon: Icon, size: f32) -> Response {
     };
     ui.painter()
         .circle_filled(rect.center(), size * 0.5, fill);
-    paint_icon(ui.painter(), Rect::from_center_size(rect.center(), Vec2::splat(24.0)), &icon, BG);
+    paint_icon(ui.painter(), Rect::from_center_size(rect.center(), Vec2::splat(24.0)), &icon, bg());
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -638,7 +663,7 @@ pub fn player_icon_button(ui: &mut Ui, icon: Icon, size: f32) -> Response {
     let color = if matches!(icon, Icon::BookmarkCheck) {
         ACCENT_SOFT
     } else {
-        TEXT
+        text()
     };
     if response.hovered() || response.has_focus() {
         ui.painter().circle_filled(
@@ -660,11 +685,11 @@ pub fn player_icon_button(ui: &mut Ui, icon: Icon, size: f32) -> Response {
 pub fn choice_chip(ui: &mut Ui, selected: bool, label: &str) -> Response {
     let text = RichText::new(label)
         .font(if selected { semibold(11.5) } else { medium(11.5) })
-        .color(if selected { Color32::WHITE } else { DIM });
+        .color(if selected { Color32::WHITE } else { dim() });
     ui.add(
         egui::Button::new(text)
             .fill(if selected {
-                ACCENT
+                accent()
             } else {
                 Color32::from_white_alpha(8)
             })
@@ -888,12 +913,12 @@ fn paint_seek_number(painter: &egui::Painter, rect: Rect, color: Color32) {
 
 /// Rounded placeholder used while a thumbnail downloads (or when it failed).
 pub fn placeholder_thumbnail(painter: &egui::Painter, rect: Rect) {
-    painter.rect_filled(rect, CornerRadius::same(RADIUS), PANEL_2);
+    painter.rect_filled(rect, CornerRadius::same(RADIUS), panel_2());
     paint_icon(
         painter,
         Rect::from_center_size(rect.center(), Vec2::splat(28.0)),
         &Icon::Play,
-        DIM_2,
+        dim_2(),
     );
 }
 
@@ -912,7 +937,8 @@ pub fn progress(
     // keep the resting line hairline-thin and let it grow under the pointer.
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::click_and_drag());
     let active = response.hovered() || response.dragged();
-    let thickness = height + if active { 2.0 } else { 0.0 };
+    let hover = ui.ctx().animate_bool_with_time(response.id.with("grip"), active || response.has_focus(), 0.12);
+    let thickness = height + 2.0 * hover;
     let line = Rect::from_center_size(rect.center(), Vec2::new(width, thickness));
     let target = response.interact_pointer_pos().and_then(|pos| {
         (width > 0.0).then(|| ((pos.x - line.left()) / width).clamp(0.0, 1.0))
@@ -925,9 +951,9 @@ pub fn progress(
     if shown > 0.0 {
         ui.painter().rect_filled(filled, radius, hovered_fill);
     }
-    if response.hovered() || response.dragged() || response.has_focus() {
+    if hover > 0.0 {
         ui.painter().circle_filled(
-            egui::pos2(filled.right(), line.center().y), 6.0, TEXT,
+            egui::pos2(filled.right(), line.center().y), 6.0 * hover, text(),
         );
     }
     if response.dragged() {
@@ -1058,7 +1084,7 @@ mod tests {
         let mut frame = |events| {
             ctx.run(egui::RawInput { events, ..Default::default() }, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    track = progress(ui, 200.0, 0.3, 3.0, ACCENT).0.rect;
+                    track = progress(ui, 200.0, 0.3, 3.0, accent()).0.rect;
                 });
             }).platform_output.cursor_icon
         };

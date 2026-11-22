@@ -150,6 +150,7 @@ struct SettingsDraft {
     watch_zoom: bool,
     anim_speed: String,
     icon_skin: String,
+    appearance: t::Appearance,
 }
 
 /// The card-to-player opening motion. The route only changes when this ends,
@@ -1007,6 +1008,7 @@ impl App {
 
         app.refresh_subs();
         app.load_settings_draft();
+        app.settings.appearance.apply(&app.ctx);
         app.skins = t::scan_skins(&skins_dir());
         let skin_ctx = app.ctx.clone();
         app.apply_icon_skin(&skin_ctx, false);
@@ -1517,6 +1519,7 @@ impl App {
                     &db::get_setting(conn, "anim_speed").unwrap_or_default(),
                 )
                 .to_string(),
+                appearance: t::Appearance::load(&db::get_setting(conn, "appearance").unwrap_or_default()),
                 icon_skin: db::get_setting(conn, "icon_skin").unwrap_or_default(),
                 auto_update: db::get_setting(conn, "auto_update")
                     .map(|value| value != "0")
@@ -1889,7 +1892,7 @@ impl App {
             .on_hover_cursor(egui::CursorIcon::PointingHand);
         if response.hovered() {
             ui.painter()
-                .rect_filled(chip, CornerRadius::same(t::RADIUS), t::PANEL_2);
+                .rect_filled(chip, CornerRadius::same(t::RADIUS), t::panel_2());
         }
         let icon = Rect::from_min_size(
             egui::pos2(chip.left() + 9.0, chip.center().y - 7.0),
@@ -1943,15 +1946,15 @@ impl App {
     /// a tick only when the last pull/merge/push actually succeeded.
     fn sync_state(&self) -> (&'static str, Color32, bool) {
         if self.sync_status.mode.is_empty() || self.sync_status.mode == "off" {
-            ("Sync off", t::DIM_2, false)
+            ("Sync off", t::dim_2(), false)
         } else if !self.sync_status.enabled {
-            ("Not connected", t::DIM, false)
+            ("Not connected", t::dim(), false)
         } else if !self.sync_status.last_error.is_empty() {
             ("Sync failed", t::DANGER, false)
         } else if self.sync_status.last_at > 0 {
             ("Synced", t::GOOD, true)
         } else {
-            ("Ready to sync", t::DIM, false)
+            ("Ready to sync", t::dim(), false)
         }
     }
 
@@ -2655,7 +2658,7 @@ impl App {
         egui::TopBottomPanel::top("top")
             .exact_height(t::TOP_BAR_HEIGHT * reveal)
             .frame(
-                egui::Frame::NONE.fill(t::BG).inner_margin(Margin::symmetric(
+                egui::Frame::NONE.fill(t::bg()).inner_margin(Margin::symmetric(
                     20,
                     // Shrink the padding with the bar, so the collapsing
                     // panel never has more margin than height.
@@ -2690,17 +2693,17 @@ impl App {
                         back
                     };
                     let back_tint = if !can_go_back {
-                        t::DIM_2.gamma_multiply(0.6)
+                        t::dim_2().gamma_multiply(0.6)
                     } else if back.hovered() {
-                        t::TEXT
+                        t::text()
                     } else {
-                        t::DIM
+                        t::dim()
                     };
                     if can_go_back && back.hovered() {
                         ui.painter().rect_filled(
                             back_rect,
                             CornerRadius::same(t::RADIUS),
-                            t::PANEL_2,
+                            t::panel_2(),
                         );
                     }
                     t::paint_icon(ui.painter(), back_rect, &t::Icon::Back, back_tint);
@@ -2744,17 +2747,17 @@ impl App {
                         forward_button
                     };
                     let forward_tint = if !can_go_forward {
-                        t::DIM_2.gamma_multiply(0.6)
+                        t::dim_2().gamma_multiply(0.6)
                     } else if forward_button.hovered() {
-                        t::TEXT
+                        t::text()
                     } else {
-                        t::DIM
+                        t::dim()
                     };
                     if can_go_forward && forward_button.hovered() {
                         ui.painter().rect_filled(
                             forward_rect,
                             CornerRadius::same(t::RADIUS),
-                            t::PANEL_2,
+                            t::panel_2(),
                         );
                     }
                     t::paint_icon(
@@ -2784,14 +2787,14 @@ impl App {
                     ui.painter().rect_filled(
                         pill,
                         CornerRadius::same(t::RADIUS),
-                        if response.hovered() { t::PANEL_3 } else { t::PANEL_2 },
+                        if response.hovered() { t::panel_3() } else { t::panel_2() },
                     );
                     ui.painter().text(
                         pill.center(),
                         Align2::CENTER_CENTER,
                         "Update",
                         t::semibold(12.0),
-                        t::ACCENT,
+                        t::accent(),
                     );
                     if response.clicked() {
                         self.navigate(Route::Settings);
@@ -2842,14 +2845,14 @@ impl App {
                         ui.painter().rect_filled(
                             toggle_rect,
                             CornerRadius::same(t::RADIUS),
-                            t::PANEL_2,
+                            t::panel_2(),
                         );
                     }
                     t::paint_icon(
                         ui.painter(),
                         toggle_rect,
                         &t::Icon::Sidebar,
-                        if toggle.hovered() { t::TEXT } else { t::DIM },
+                        if toggle.hovered() { t::text() } else { t::dim() },
                     );
                     if toggle.clicked() {
                         self.sidebar_visible = !self.sidebar_visible;
@@ -2964,7 +2967,8 @@ impl App {
             self.topbar_to = target;
             self.topbar_started = Instant::now();
         }
-        let duration = (CHROME_DURATION * self.anim_scale()).max(0.001);
+        let duration =
+            travel_duration(CHROME_DURATION * self.anim_scale(), self.topbar_from, target);
         let progress = (self.topbar_started.elapsed().as_secs_f32() / duration).clamp(0.0, 1.0);
         self.topbar_reveal =
             self.topbar_from + (self.topbar_to - self.topbar_from) * t::smoothstep(progress);
@@ -3012,7 +3016,7 @@ impl App {
                 ui.painter().rect_filled(
                     rect.shrink2(Vec2::new(1.0, 3.0)),
                     CornerRadius::same(t::RADIUS_SMALL),
-                    if close { t::DANGER } else { t::PANEL_2 },
+                    if close { t::DANGER } else { t::panel_2() },
                 );
             }
             t::paint_window_glyph(
@@ -3022,7 +3026,7 @@ impl App {
                 if response.hovered() {
                     Color32::WHITE
                 } else {
-                    t::DIM
+                    t::dim()
                 },
             );
             if response.clicked() {
@@ -3166,7 +3170,7 @@ impl App {
         // Time-based rather than dt-based: the first frame after an idle
         // stretch used to carry a huge dt and snap the drawer most of the way
         // open, which read as a pop instead of a slide.
-        let duration = SIDEBAR_DURATION * self.anim_scale();
+        let duration = travel_duration(SIDEBAR_DURATION * self.anim_scale(), self.sidebar_from, target);
         let t = (self.sidebar_started.elapsed().as_secs_f32() / duration).clamp(0.0, 1.0);
         self.sidebar_reveal =
             self.sidebar_from + (self.sidebar_to - self.sidebar_from) * t::smoothstep(t);
@@ -3346,7 +3350,7 @@ impl App {
                 Align2::CENTER_TOP,
                 "F to exit fullscreen",
                 t::medium(11.0),
-                t::DIM_2.gamma_multiply(hint),
+                t::dim_2().gamma_multiply(hint),
             );
         }
     }
@@ -3578,7 +3582,7 @@ impl App {
         .rect_filled(
             rect,
             CornerRadius::same(2),
-            t::ACCENT.gamma_multiply(if hovered { 0.95 } else { 0.35 }),
+            t::accent().gamma_multiply(if hovered { 0.95 } else { 0.35 }),
         );
     }
 
@@ -3592,7 +3596,7 @@ impl App {
             .resizable(false)
             .frame(
                 egui::Frame::NONE
-                    .fill(t::PANEL)
+                    .fill(t::panel())
                     .inner_margin(Margin::symmetric(12, 12)),
             )
             .show(ctx, |ui| {
@@ -3633,7 +3637,7 @@ impl App {
             .interactable(true)
             .show(ctx, |ui| {
                 egui::Frame::NONE
-                    .fill(t::PANEL)
+                    .fill(t::panel())
                     .shadow(egui::epaint::Shadow {
                         offset: [3, 0],
                         blur: 24,
@@ -3707,7 +3711,7 @@ impl App {
                             ui.label(
                                 RichText::new("Channels you subscribe to appear here and sync across devices.")
                                     .size(12.0)
-                                    .color(t::DIM_2),
+                                    .color(t::dim_2()),
                             );
                         }
                         for sub in subs {
@@ -3722,7 +3726,7 @@ impl App {
                                 self.paint_avatar(ui, &label, &sub.channel_avatar, 22.0);
                                 ui.add(
                                     egui::Label::new(
-                                        RichText::new(&label).size(13.0).color(t::DIM),
+                                        RichText::new(&label).size(13.0).color(t::dim()),
                                     )
                                     .truncate(),
                                 );
@@ -3789,13 +3793,13 @@ impl App {
             }
         }
         ui.painter()
-            .circle_filled(rect.center(), diameter * 0.5, t::PANEL_2);
+            .circle_filled(rect.center(), diameter * 0.5, t::panel_2());
         ui.painter().text(
             rect.center(),
             Align2::CENTER_CENTER,
             t::initials(name),
             t::semibold(diameter * 0.36),
-            t::DIM,
+            t::dim(),
         );
     }
 
@@ -3825,7 +3829,7 @@ impl App {
             return;
         };
         if cards.is_empty() {
-            ui.label(RichText::new("Nothing came back from the video source.").color(t::DIM));
+            ui.label(RichText::new("Nothing came back from the video source.").color(t::dim()));
             return;
         }
         self.video_grid(ui, cards);
@@ -3877,7 +3881,7 @@ impl App {
                             .is_some_and(|pos| row.contains(pos));
                         if hovering {
                             ui.painter()
-                                .rect_filled(row, CornerRadius::same(t::RADIUS), t::PANEL_2);
+                                .rect_filled(row, CornerRadius::same(t::RADIUS), t::panel_2());
                         }
                         let icon = Rect::from_min_size(
                             egui::pos2(row.left() + 8.0, row.center().y - 18.0),
@@ -3904,7 +3908,7 @@ impl App {
                             Align2::LEFT_CENTER,
                             &channel.name,
                             t::medium(13.5),
-                            t::TEXT,
+                            t::text(),
                         );
                         painter.text(
                             egui::pos2(icon.right() + 10.0, row.center().y + 10.0),
@@ -3915,16 +3919,16 @@ impl App {
                                 "Channel".to_string()
                             },
                             t::regular(10.5),
-                            t::DIM_2,
+                            t::dim_2(),
                         );
                         if hovering {
                             let subscribed = self
                                 .with_db(|conn| db::is_subscribed(conn, &channel.id))
                                 .unwrap_or(false);
                             let (label, fill, stroke, text_color) = if subscribed {
-                                ("Subscribed", Color32::TRANSPARENT, t::LINE, t::TEXT)
+                                ("Subscribed", Color32::TRANSPARENT, t::line(), t::text())
                             } else {
-                                ("Subscribe", t::ACCENT, Color32::TRANSPARENT, t::ON_ACCENT)
+                                ("Subscribe", t::accent(), Color32::TRANSPARENT, t::ON_ACCENT)
                             };
                             let button = ui
                                 .put(
@@ -3964,7 +3968,7 @@ impl App {
 
         if results.videos.is_empty() {
             if results.channels.is_empty() {
-                ui.label(RichText::new("No results.").color(t::DIM));
+                ui.label(RichText::new("No results.").color(t::dim()));
             }
             return;
         }
@@ -4007,7 +4011,7 @@ impl App {
             return;
         };
         if cards.is_empty() {
-            ui.label(RichText::new("Nothing new right now.").color(t::DIM));
+            ui.label(RichText::new("Nothing new right now.").color(t::dim()));
             return;
         }
         self.video_grid(ui, cards);
@@ -4048,7 +4052,7 @@ impl App {
                 }
                 None => {
                     ui.painter()
-                        .rect_filled(banner, CornerRadius::same(t::RADIUS), t::PANEL_2);
+                        .rect_filled(banner, CornerRadius::same(t::RADIUS), t::panel_2());
                 }
             }
             ui.add_space(10.0);
@@ -4082,7 +4086,7 @@ impl App {
 
         if !channel.description.is_empty() {
             ui.add_space(8.0);
-            ui.label(RichText::new(&channel.description).size(12.5).color(t::DIM));
+            ui.label(RichText::new(&channel.description).size(12.5).color(t::dim()));
         }
 
         ui.add_space(18.0);
@@ -4099,7 +4103,7 @@ impl App {
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(RichText::new("Loading more…").size(11.5).color(t::DIM_2));
+                    ui.label(RichText::new("Loading more…").size(11.5).color(t::dim_2()));
                 });
             } else if wants_more_page(
                 ui.clip_rect().bottom(),
@@ -4176,18 +4180,9 @@ impl App {
         if alpha <= 0.004 {
             return None;
         }
-        let mut shade = egui::Mesh::default();
-        for (pos, opacity) in [
-            (egui::pos2(poster.left(), rect.top() - 30.0), 0.0),
-            (egui::pos2(poster.right(), rect.top() - 30.0), 0.0),
-            (poster.left_bottom(), 232.0),
-            (poster.right_bottom(), 232.0),
-        ] {
-            shade.colored_vertex(pos, Color32::from_black_alpha((opacity * alpha) as u8));
-        }
-        shade.add_triangle(0, 1, 2);
-        shade.add_triangle(2, 1, 3);
-        ui.painter().add(shade);
+        // A floating transport panel keeps controls legible without shading the whole picture.
+        ui.painter().rect_filled(rect, CornerRadius::same(18), Color32::from_black_alpha((207.0 * alpha) as u8));
+        ui.painter().rect_stroke(rect, CornerRadius::same(18), egui::Stroke::new(1.0_f32, Color32::from_white_alpha((46.0 * alpha) as u8)), egui::StrokeKind::Inside);
 
         let mut hud = ui.new_child(
             egui::UiBuilder::new()
@@ -4210,7 +4205,7 @@ impl App {
         };
 
         let (seek_response, seek_line, target) =
-            t::progress(&mut hud, rect.width() - 28.0, fraction, 3.0, t::ACCENT);
+            t::progress(&mut hud, rect.width() - 28.0, fraction, 4.0, Color32::WHITE);
         self.scrubbing = seek_response.dragged();
         if let Some(target) = target {
             if duration > 0.0 {
@@ -4225,7 +4220,7 @@ impl App {
                 let galley = hud.painter().layout_no_wrap(
                     label,
                     t::semibold(11.5),
-                    t::TEXT,
+                    t::text(),
                 );
                 let padding = Vec2::new(7.0, 3.0);
                 let size = galley.size() + padding * 2.0;
@@ -4241,7 +4236,7 @@ impl App {
                     Color32::from_black_alpha(230),
                 );
                 hud.painter()
-                    .galley(tooltip.min + padding, galley, t::TEXT);
+                    .galley(tooltip.min + padding, galley, t::text());
             }
         }
 
@@ -4285,7 +4280,7 @@ impl App {
                 0.0,
                 egui::TextFormat {
                     font_id: t::semibold(12.5),
-                    color: t::TEXT,
+                    color: t::text(),
                     ..Default::default()
                 },
             );
@@ -4295,7 +4290,7 @@ impl App {
                     0.0,
                     egui::TextFormat {
                         font_id: t::medium(10.5),
-                        color: t::DIM_2,
+                        color: t::dim_2(),
                         ..Default::default()
                     },
                 );
@@ -4304,7 +4299,7 @@ impl App {
                     0.0,
                     egui::TextFormat {
                         font_id: t::medium(12.0),
-                        color: t::DIM,
+                        color: t::dim(),
                         ..Default::default()
                     },
                 );
@@ -4360,7 +4355,7 @@ impl App {
                     ui.label(
                         RichText::new("Playback settings")
                             .font(t::semibold(14.0))
-                            .color(t::TEXT),
+                            .color(t::text()),
                     );
                     ui.add_space(2.0);
 
@@ -4368,7 +4363,7 @@ impl App {
                     ui.label(
                         RichText::new("VOLUME")
                             .font(t::semibold(10.0))
-                            .color(t::DIM_2),
+                            .color(t::dim_2()),
                     );
                     ui.horizontal(|ui| {
                         let rail = (ui.available_width() - 42.0).max(80.0);
@@ -4377,7 +4372,7 @@ impl App {
                             Layout::left_to_right(Align::Center),
                             |ui| {
                                 let (_, _, target) =
-                                    t::progress(ui, rail, volume as f32 / 130.0, 3.0, t::ACCENT);
+                                    t::progress(ui, rail, volume as f32 / 130.0, 3.0, Color32::WHITE);
                                 if let Some(target) = target {
                                     self.set_volume((target * 130.0).round() as i32);
                                 }
@@ -4386,7 +4381,7 @@ impl App {
                         ui.label(
                             RichText::new(format!("{volume}%"))
                                 .font(t::medium(11.5))
-                                .color(t::DIM),
+                                .color(t::dim()),
                         );
                     });
 
@@ -4394,7 +4389,7 @@ impl App {
                     ui.label(
                         RichText::new("QUALITY")
                             .font(t::semibold(10.0))
-                            .color(t::DIM_2),
+                            .color(t::dim_2()),
                     );
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
@@ -4416,7 +4411,7 @@ impl App {
                     ui.label(
                         RichText::new("SPEED")
                             .font(t::semibold(10.0))
-                            .color(t::DIM_2),
+                            .color(t::dim_2()),
                     );
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
@@ -4505,14 +4500,14 @@ impl App {
         t::panel_frame().inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             if !meta.is_empty() {
-                ui.label(RichText::new(meta).font(t::medium(11.5)).color(t::DIM));
+                ui.label(RichText::new(meta).font(t::medium(11.5)).color(t::dim()));
             }
             match &self.description {
                 Load::Ready(text) if !text.is_empty() => {
                     let expand = ui.id().with(("description-expanded", id));
                     let expanded = ui.data(|data| data.get_temp::<bool>(expand)).unwrap_or(false);
                     let mut job = egui::text::LayoutJob::simple(
-                        text.clone(), t::regular(13.0), t::TEXT, ui.available_width(),
+                        text.clone(), t::regular(13.0), t::text(), ui.available_width(),
                     );
                     job.wrap.max_rows = if expanded { usize::MAX } else { 2 };
                     let galley = ui.fonts(|fonts| fonts.layout_job(job));
@@ -4522,14 +4517,14 @@ impl App {
                         ui.data_mut(|data| data.insert_temp(expand, !expanded));
                     }
                 }
-                Load::Ready(_) => { ui.label(RichText::new("No description.").color(t::DIM)); }
+                Load::Ready(_) => { ui.label(RichText::new("No description.").color(t::dim())); }
                 Load::Failed(_) => {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Couldn’t load the description.").color(t::DIM));
+                        ui.label(RichText::new("Couldn’t load the description.").color(t::dim()));
                         retry = ui.link("Retry").clicked();
                     });
                 }
-                _ => { ui.label(RichText::new("Loading description…").color(t::DIM)); }
+                _ => { ui.label(RichText::new("Loading description…").color(t::dim())); }
             }
         });
         if retry {
@@ -4604,14 +4599,14 @@ impl App {
                                 Align2::CENTER_CENTER,
                                 "Playing in MPV",
                                 t::semibold(16.0),
-                                t::TEXT,
+                                t::text(),
                             );
                             ui.painter().text(
                                 egui::pos2(center.x, center.y + 24.0),
                                 Align2::CENTER_CENTER,
                                 "Use the mpv window for playback controls",
                                 t::regular(11.5),
-                                t::DIM,
+                                t::dim(),
                             );
                         } else {
                             ui.painter().rect_filled(
@@ -4629,14 +4624,14 @@ impl App {
                                 ui.painter(),
                                 Rect::from_center_size(center, Vec2::splat(34.0)),
                                 &t::Icon::Play,
-                                t::TEXT,
+                                t::text(),
                             );
                             ui.painter().text(
                                 egui::pos2(center.x, center.y + 46.0),
                                 Align2::CENTER_CENTER,
                                 "Play in MPV",
                                 t::semibold(12.0),
-                                t::TEXT,
+                                t::text(),
                             );
                         }
                     } else if video_ready {
@@ -4658,7 +4653,7 @@ impl App {
                                 ui.painter(),
                                 Rect::from_center_size(center, Vec2::splat(28.0)),
                                 &t::Icon::Play,
-                                t::TEXT,
+                                t::text(),
                             );
                         }
                     } else if playing_this {
@@ -4683,7 +4678,7 @@ impl App {
                             Align2::CENTER_CENTER,
                             "Starting…",
                             t::medium(11.5),
-                            t::TEXT,
+                            t::text(),
                         );
                     } else {
                         self.paint_poster(ui, poster, &id);
@@ -4694,7 +4689,7 @@ impl App {
                             ui.painter(),
                             Rect::from_center_size(center, Vec2::splat(34.0)),
                             &t::Icon::Play,
-                            t::TEXT,
+                            t::text(),
                         );
                     }
 
@@ -4778,7 +4773,7 @@ impl App {
                         ui.label(
                             RichText::new("Nothing to recommend.")
                                 .size(12.0)
-                                .color(t::DIM_2),
+                                .color(t::dim_2()),
                         );
                     }
                     egui::ScrollArea::vertical()
@@ -4832,7 +4827,7 @@ impl App {
                             .on_hover_cursor(egui::CursorIcon::PointingHand);
                         open_title |= title.clicked();
                         ui.label(
-                            RichText::new(&video.channel_name).size(11.0).color(t::DIM_2),
+                            RichText::new(&video.channel_name).size(11.0).color(t::dim_2()),
                         );
                         ui.label(
                             RichText::new(format!(
@@ -4841,7 +4836,7 @@ impl App {
                                 video.published
                             ))
                             .size(10.5)
-                            .color(t::DIM_2),
+                            .color(t::dim_2()),
                         );
                     });
                 },
@@ -4941,7 +4936,7 @@ impl App {
                                         Vec2::new(thumb.width() * fraction, 3.0),
                                     );
                                     ui.painter()
-                                        .rect_filled(bar, CornerRadius::same(t::RADIUS), t::ACCENT);
+                                        .rect_filled(bar, CornerRadius::same(t::RADIUS), t::accent());
                                 }
                                 ui.add_space(10.0);
                                 ui.vertical(|ui| {
@@ -4968,7 +4963,7 @@ impl App {
                                             t::format_relative(item.watched_at)
                                         ))
                                         .size(11.5)
-                                        .color(t::DIM_2),
+                                        .color(t::dim_2()),
                                     );
                                     if item.position > 30 {
                                         ui.label(
@@ -5077,7 +5072,7 @@ impl App {
                 ui.label(
                     RichText::new("No playlists yet — create one below.")
                         .size(11.5)
-                        .color(t::DIM_2),
+                        .color(t::dim_2()),
                 );
             }
             for playlist in &playlists {
@@ -5085,7 +5080,7 @@ impl App {
                     .with_db(|conn| db::is_in_playlist(conn, &playlist.playlist_id, &card.id))
                     .unwrap_or(false);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(&playlist.name).size(12.5).color(t::DIM));
+                    ui.label(RichText::new(&playlist.name).size(12.5).color(t::dim()));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if t::quiet_button(ui, if inside { "Remove" } else { "Add" }).clicked() {
                             let _ = self.with_db(|conn| {
@@ -5197,7 +5192,7 @@ impl App {
                                 channel
                             })
                             .size(11.5)
-                            .color(t::DIM_2),
+                            .color(t::dim_2()),
                         );
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -5225,7 +5220,7 @@ impl App {
                 ui.spinner();
             }
             Load::Failed(err) => {
-                ui.label(RichText::new(err).size(12.5).color(t::DIM));
+                ui.label(RichText::new(err).size(12.5).color(t::dim()));
             }
             Load::Ready(items) => {
                 let items = items.clone();
@@ -5308,7 +5303,7 @@ impl App {
                 return;
             }
             Load::Failed(err) => {
-                ui.label(RichText::new(err).size(12.5).color(t::DIM));
+                ui.label(RichText::new(err).size(12.5).color(t::dim()));
                 return;
             }
             Load::Ready(list) => list.clone(),
@@ -5343,7 +5338,7 @@ impl App {
                             if playlist.item_count == 1 { "" } else { "s" }
                         ))
                         .size(11.5)
-                        .color(t::DIM_2),
+                        .color(t::dim_2()),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let label = if armed { "Click again to delete" } else { "Delete" };
@@ -5398,7 +5393,7 @@ impl App {
                 return;
             }
             Load::Failed(err) => {
-                ui.label(RichText::new(err).size(12.5).color(t::DIM));
+                ui.label(RichText::new(err).size(12.5).color(t::dim()));
                 return;
             }
             Load::Ready(items) => items.clone(),
@@ -5502,9 +5497,9 @@ impl App {
                     |ui| {
                         t::card_frame().show(ui, |ui| {
                             ui.set_width(width - 32.0);
-                            ui.label(RichText::new(label.to_uppercase()).size(10.5).color(t::DIM_2).strong());
+                            ui.label(RichText::new(label.to_uppercase()).size(10.5).color(t::dim_2()).strong());
                             ui.label(RichText::new(value).size(24.0).strong());
-                            ui.label(RichText::new(hint).size(11.0).color(t::DIM_2));
+                            ui.label(RichText::new(hint).size(11.0).color(t::dim_2()));
                         });
                     },
                 );
@@ -5544,9 +5539,9 @@ impl App {
                     Vec2::new((step - 4.0).max(2.0), bar_height.max(3.0)),
                 );
                 let color = if day.seconds > 0 {
-                    t::ACCENT
+                    t::accent()
                 } else {
-                    t::PANEL_3
+                    t::panel_3()
                 };
                 painter.rect_filled(bar, CornerRadius::same(t::RADIUS), color);
             }
@@ -5555,14 +5550,14 @@ impl App {
                 Align2::LEFT_BOTTOM,
                 stats.daily.first().map(|d| d.day.clone()).unwrap_or_default(),
                 FontId::proportional(10.0),
-                t::DIM_2,
+                t::dim_2(),
             );
             painter.text(
                 egui::pos2(rect.right(), rect.bottom()),
                 Align2::RIGHT_BOTTOM,
                 stats.daily.last().map(|d| d.day.clone()).unwrap_or_default(),
                 FontId::proportional(10.0),
-                t::DIM_2,
+                t::dim_2(),
             );
 
             if let Some(pos) = response.hover_pos() {
@@ -5581,7 +5576,7 @@ impl App {
         t::section(ui, "Most watched channels");
         t::panel_frame().show(ui, |ui| {
             if stats.top_channels.is_empty() {
-                ui.label(RichText::new("No channel data yet.").size(12.0).color(t::DIM_2));
+                ui.label(RichText::new("No channel data yet.").size(12.0).color(t::dim_2()));
                 return;
             }
             let top = stats.top_channels[0].seconds.max(1);
@@ -5607,7 +5602,7 @@ impl App {
                         .max(40.0);
                     let (bar, _) = ui.allocate_exact_size(Vec2::new(width, 8.0), Sense::hover());
                     ui.painter()
-                        .rect_filled(bar, CornerRadius::same(t::RADIUS), t::PANEL_3);
+                        .rect_filled(bar, CornerRadius::same(t::RADIUS), t::panel_3());
                     let fill = Rect::from_min_size(
                         bar.min,
                         Vec2::new(
@@ -5616,7 +5611,7 @@ impl App {
                         ),
                     );
                     ui.painter()
-                        .rect_filled(fill, CornerRadius::same(t::RADIUS), t::ACCENT);
+                        .rect_filled(fill, CornerRadius::same(t::RADIUS), t::accent());
                     ui.add_space(gap);
                     ui.allocate_ui_with_layout(
                         Vec2::new(value_width, 16.0),
@@ -5625,7 +5620,7 @@ impl App {
                             ui.label(
                                 RichText::new(t::format_long(channel.seconds))
                                     .size(11.5)
-                                    .color(t::DIM),
+                                    .color(t::dim()),
                             );
                         },
                     );
@@ -5651,7 +5646,7 @@ impl App {
                             "Choose whether video is drawn inside RustTube or opened in a separate mpv window.",
                         )
                         .size(11.8)
-                        .color(t::DIM_2),
+                        .color(t::dim_2()),
                     );
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
@@ -5677,11 +5672,11 @@ impl App {
                                 "Stretch the built-in player across the page and hide the Up next rail.",
                             )
                             .size(11.0)
-                            .color(t::DIM_2),
+                            .color(t::dim_2()),
                         );
                     }
                     ui.add_space(10.0);
-                    ui.label(RichText::new("Default playback speed").size(12.0).color(t::DIM));
+                    ui.label(RichText::new("Default playback speed").size(12.0).color(t::dim()));
                     let mut speed = self.settings.playback_speed;
                     if ui
                         .add(
@@ -5696,7 +5691,7 @@ impl App {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new("Default quality").size(12.0).color(t::DIM),
+                            RichText::new("Default quality").size(12.0).color(t::dim()),
                         );
                         let mut quality =
                             Quality::from_setting(&self.settings.quality);
@@ -5724,11 +5719,11 @@ impl App {
                             "Hover a thumbnail to play a short muted preview after a moment.",
                         )
                         .size(11.0)
-                        .color(t::DIM_2),
+                        .color(t::dim_2()),
                     );
                     if self.settings.playback == "mpv" {
                         ui.add_space(8.0);
-                        ui.label(RichText::new("mpv executable").size(12.0).color(t::DIM));
+                        ui.label(RichText::new("mpv executable").size(12.0).color(t::dim()));
                         let width = ui.available_width();
                         ui.add(
                             egui::TextEdit::singleline(&mut self.settings.mpv_path)
@@ -5740,14 +5735,14 @@ impl App {
                                 "Requires mpv. Leave blank to use a bundled mpv, a Homebrew install, or mpv on PATH. History and resume time still update while MPV plays.",
                             )
                             .size(11.0)
-                            .color(t::DIM_2),
+                            .color(t::dim_2()),
                         );
                     }
                     ui.add_space(6.0);
                     ui.label(
                         RichText::new("Changes apply when you save settings.")
                             .size(11.0)
-                            .color(t::DIM_2),
+                            .color(t::dim_2()),
                     );
                 });
 
@@ -5759,11 +5754,27 @@ impl App {
                     ui.label(
                         RichText::new("Small behaviours that change how the app feels.")
                             .size(11.8)
-                            .color(t::DIM_2),
+                            .color(t::dim_2()),
                     );
                     ui.add_space(10.0);
                     ui.add_space(12.0);
-                    ui.label(RichText::new("Icon skin").size(12.0).color(t::DIM));
+                    ui.label(RichText::new("Color theme").size(12.0).color(t::dim()));
+                    let mut appearance = self.settings.appearance;
+                    egui::ComboBox::from_id_salt("appearance").selected_text(appearance.label()).show_ui(ui, |ui| {
+                        for choice in [t::Appearance::RustTube, t::Appearance::Oled, t::Appearance::YouTube] {
+                            ui.selectable_value(&mut appearance, choice, choice.label());
+                        }
+                    });
+                    if appearance != self.settings.appearance {
+                        if self.with_db(|conn| db::set_setting(conn, "appearance", appearance.key()).is_ok()) == Some(true) {
+                            self.settings.appearance = appearance;
+                            appearance.apply(ui.ctx());
+                        } else {
+                            self.toast("Could not save the color theme");
+                        }
+                    }
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("Icon skin").size(12.0).color(t::dim()));
                     let current_skin = if self.settings.icon_skin.is_empty() {
                         "RustTube (built-in)".to_string()
                     } else if self.settings.icon_skin == t::SF_SYMBOLS_ID {
@@ -5820,7 +5831,7 @@ impl App {
                             egui::Label::new(
                                 RichText::new(format!("Folder: {path}"))
                                     .size(10.5)
-                                    .color(t::DIM_2),
+                                    .color(t::dim_2()),
                             )
                             .truncate(),
                         )
@@ -5831,7 +5842,7 @@ impl App {
                             "Optional. A folder skin, or the system SF Symbols on macOS; nothing leaves this machine.",
                         )
                         .size(11.0)
-                        .color(t::DIM_2),
+                        .color(t::dim_2()),
                     );
                     ui.add_space(12.0);
                     let mut hover = self.settings.sidebar_hover;
@@ -5850,7 +5861,7 @@ impl App {
                             "Slides in when the pointer touches the left edge. The top-bar button then pins it open.",
                         )
                         .size(11.0)
-                        .color(t::DIM_2),
+                        .color(t::dim_2()),
                     );
                     ui.add_space(8.0);
                     let mut zoom = self.settings.watch_zoom;
@@ -5873,10 +5884,10 @@ impl App {
                             "Opening a video grows the thumbnail you clicked into the player instead of cutting.",
                         )
                         .size(11.0)
-                        .color(t::DIM_2),
+                        .color(t::dim_2()),
                     );
                     ui.add_space(12.0);
-                    ui.label(RichText::new("Animation speed").size(12.0).color(t::DIM));
+                    ui.label(RichText::new("Animation speed").size(12.0).color(t::dim()));
                     ui.horizontal(|ui| {
                         for (preset, label) in
                             [("slow", "Slow"), ("normal", "Normal"), ("fast", "Fast")]
@@ -5897,7 +5908,7 @@ impl App {
                             "Controls the sidebar slide and the video open/close transitions. Normal is the default.",
                         )
                         .size(11.0)
-                        .color(t::DIM_2),
+                        .color(t::dim_2()),
                     );
                 });
 
@@ -5911,10 +5922,10 @@ impl App {
                             "Metadata comes from Invidious or Piped instances. Playback goes through mpv and yt-dlp.",
                         )
                         .size(11.8)
-                        .color(t::DIM_2),
+                        .color(t::dim_2()),
                     );
                     ui.add_space(10.0);
-                    ui.label(RichText::new("Instance URL").size(12.0).color(t::DIM));
+                    ui.label(RichText::new("Instance URL").size(12.0).color(t::dim()));
                     let width = ui.available_width();
                     ui.add(
                         egui::TextEdit::singleline(&mut self.settings.api_base)
@@ -5931,13 +5942,13 @@ impl App {
                             }
                         ))
                         .size(11.0)
-                        .color(t::DIM_2),
+                        .color(t::dim_2()),
                     );
 
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
-                            ui.label(RichText::new("Trending region").size(12.0).color(t::DIM));
+                            ui.label(RichText::new("Trending region").size(12.0).color(t::dim()));
                             egui::ComboBox::from_id_salt("region")
                                 .selected_text(self.settings.region.clone())
                                 .show_ui(ui, |ui| {
@@ -5952,7 +5963,7 @@ impl App {
                         });
                         ui.add_space(18.0);
                         ui.vertical(|ui| {
-                            ui.label(RichText::new("Watch history").size(12.0).color(t::DIM));
+                            ui.label(RichText::new("Watch history").size(12.0).color(t::dim()));
                             ui.checkbox(
                                 &mut self.settings.history_enabled,
                                 "Record history and watch time",
@@ -5971,7 +5982,7 @@ impl App {
                             "Subscriptions, history, watch time, saved videos, playlists and settings are written as one JSON snapshot into storage you control. No account, no server in the middle.",
                         )
                         .size(11.8)
-                        .color(t::DIM_2),
+                        .color(t::dim_2()),
                     );
                     ui.add_space(12.0);
 
@@ -6003,7 +6014,7 @@ impl App {
                                 "RustTube writes into the folder a signed-in desktop client already syncs, so only installed clients can be picked here. Folder and WebDAV below work with anything else.",
                             )
                             .size(11.8)
-                            .color(t::DIM_2),
+                            .color(t::dim_2()),
                         );
                         ui.add_space(8.0);
                         let mut chosen: Option<String> = None;
@@ -6015,17 +6026,17 @@ impl App {
                                     mount.is_some(),
                                     egui::Button::new(
                                         RichText::new(label).size(11.5).color(if active {
-                                            t::TEXT
+                                            t::text()
                                         } else if mount.is_some() {
-                                            t::DIM
+                                            t::dim()
                                         } else {
-                                            t::DIM_2
+                                            t::dim_2()
                                         }),
                                     )
-                                    .fill(if active { t::PANEL_2 } else { Color32::TRANSPARENT })
+                                    .fill(if active { t::panel_2() } else { Color32::TRANSPARENT })
                                     .stroke(Stroke::new(
                                         1.0_f32,
-                                        if active { t::ACCENT } else { t::LINE },
+                                        if active { t::accent() } else { t::line() },
                                     ))
                                     .corner_radius(CornerRadius::same(t::RADIUS)),
                                 );
@@ -6055,7 +6066,7 @@ impl App {
                             ui.label(
                                 RichText::new(path.display().to_string())
                                     .size(11.0)
-                                    .color(t::DIM_2),
+                                    .color(t::dim_2()),
                             );
                         }
                     }
@@ -6064,7 +6075,7 @@ impl App {
                         ui.label(
                             RichText::new("Folder kept in sync by iCloud Drive, OneDrive, Dropbox…")
                                 .size(12.0)
-                                .color(t::DIM),
+                                .color(t::dim()),
                         );
                         let width = ui.available_width();
                         ui.add(
@@ -6079,10 +6090,10 @@ impl App {
                                     if ui
                                         .add(
                                             egui::Button::new(
-                                                RichText::new(preset.label).size(11.5).color(t::DIM),
+                                                RichText::new(preset.label).size(11.5).color(t::dim()),
                                             )
                                             .fill(Color32::TRANSPARENT)
-                                            .stroke(Stroke::new(1.0_f32, t::LINE))
+                                            .stroke(Stroke::new(1.0_f32, t::line()))
                                             .corner_radius(CornerRadius::same(t::RADIUS)),
                                         )
                                         .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -6096,7 +6107,7 @@ impl App {
                     }
 
                     if self.settings.sync_mode == "webdav" {
-                        ui.label(RichText::new("WebDAV address").size(12.0).color(t::DIM));
+                        ui.label(RichText::new("WebDAV address").size(12.0).color(t::dim()));
                         let width = ui.available_width();
                         ui.add(
                             egui::TextEdit::singleline(&mut self.settings.webdav_url)
@@ -6106,14 +6117,14 @@ impl App {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             ui.vertical(|ui| {
-                                ui.label(RichText::new("Username").size(12.0).color(t::DIM));
+                                ui.label(RichText::new("Username").size(12.0).color(t::dim()));
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.settings.webdav_user)
                                         .desired_width(240.0),
                                 );
                             });
                             ui.vertical(|ui| {
-                                ui.label(RichText::new("Password").size(12.0).color(t::DIM));
+                                ui.label(RichText::new("Password").size(12.0).color(t::dim()));
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.settings.webdav_pass)
                                         .password(true)
@@ -6129,12 +6140,12 @@ impl App {
                         ui.label(
                             RichText::new("Stored locally in RustTube's database, never in the synced file.")
                                 .size(11.0)
-                                .color(t::DIM_2),
+                                .color(t::dim_2()),
                         );
                     }
 
                     if self.settings.sync_mode == "rclone" {
-                        ui.label(RichText::new("rclone remote").size(12.0).color(t::DIM));
+                        ui.label(RichText::new("rclone remote").size(12.0).color(t::dim()));
                         if !self.settings.rclone_remotes.is_empty() {
                             let remotes = self.settings.rclone_remotes.clone();
                             let current = self.settings.sync_rclone.clone();
@@ -6146,15 +6157,15 @@ impl App {
                                     let button = ui.add(
                                         egui::Button::new(
                                             RichText::new(&name).size(11.5).color(if active {
-                                                t::TEXT
+                                                t::text()
                                             } else {
-                                                t::DIM
+                                                t::dim()
                                             }),
                                         )
-                                        .fill(if active { t::PANEL_2 } else { Color32::TRANSPARENT })
+                                        .fill(if active { t::panel_2() } else { Color32::TRANSPARENT })
                                         .stroke(Stroke::new(
                                             1.0_f32,
-                                            if active { t::ACCENT } else { t::LINE },
+                                            if active { t::accent() } else { t::line() },
                                         ))
                                         .corner_radius(CornerRadius::same(t::RADIUS)),
                                     );
@@ -6184,7 +6195,7 @@ impl App {
                                 "One-time setup per machine: run the wizard, choose a new remote, name it mega, pick MEGA, then enter your email, password and 2FA code. RustTube writes rusttube-sync.json into that remote.",
                             )
                             .size(11.0)
-                            .color(t::DIM_2),
+                            .color(t::dim_2()),
                         );
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
@@ -6210,7 +6221,7 @@ impl App {
                                     format!("rclone not found at {}", binary.display())
                                 })
                                 .size(11.0)
-                                .color(if self.settings.rclone_ok { t::DIM_2 } else { t::DANGER }),
+                                .color(if self.settings.rclone_ok { t::dim_2() } else { t::DANGER }),
                             );
                         });
                     }
@@ -6238,7 +6249,7 @@ impl App {
                     ui.horizontal_wrapped(|ui| {
                         Self::sync_state_icon(ui, tick, color);
                         ui.label(RichText::new(state).size(11.5).strong().color(color));
-                        ui.label(RichText::new(detail).size(11.5).color(t::DIM_2));
+                        ui.label(RichText::new(detail).size(11.5).color(t::dim_2()));
                     });
 
                     ui.add_space(10.0);
@@ -6269,32 +6280,32 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.add_sized(
                                 [110.0, 16.0],
-                                egui::Label::new(RichText::new(label).size(11.5).color(t::DIM_2)),
+                                egui::Label::new(RichText::new(label).size(11.5).color(t::dim_2())),
                             );
                             ui.add(
-                                egui::Label::new(RichText::new(value).size(11.5).color(t::DIM))
+                                egui::Label::new(RichText::new(value).size(11.5).color(t::dim()))
                                     .truncate(),
                             );
                         });
                     }
                     ui.add_space(10.0);
                     let (status, color) = match &self.update {
-                        UpdateState::Idle => ("Updates are checked once a day.".to_string(), t::DIM_2),
-                        UpdateState::Checking => ("Checking for updates…".to_string(), t::DIM),
+                        UpdateState::Idle => ("Updates are checked once a day.".to_string(), t::dim_2()),
+                        UpdateState::Checking => ("Checking for updates…".to_string(), t::dim()),
                         UpdateState::Current => (
                             format!("RustTube {} is the latest version.", update::current_version()),
-                            t::DIM,
+                            t::dim(),
                         ),
                         UpdateState::Available(release) => (
                             format!("RustTube {} is available.", release.version),
-                            t::TEXT,
+                            t::text(),
                         ),
-                        UpdateState::Installing => ("Installing the update…".to_string(), t::DIM),
-                        UpdateState::Downloading => ("Downloading the update…".to_string(), t::DIM),
-                        UpdateState::Ready => ("Installed. Restarting…".to_string(), t::DIM),
+                        UpdateState::Installing => ("Installing the update…".to_string(), t::dim()),
+                        UpdateState::Downloading => ("Downloading the update…".to_string(), t::dim()),
+                        UpdateState::Ready => ("Installed. Restarting…".to_string(), t::dim()),
                         UpdateState::Downloaded(path) => (
                             format!("Saved to {}", path.display()),
-                            t::DIM,
+                            t::dim(),
                         ),
                         UpdateState::Failed { err, .. } => (err.clone(), t::DANGER),
                     };
@@ -6338,7 +6349,7 @@ impl App {
                             "Sync copies subscriptions, history, watch time, saved videos, playlists and UI/playback settings. Credentials and device-only state such as volume stay here.",
                         )
                         .size(11.0)
-                        .color(t::DIM_2),
+                        .color(t::dim_2()),
                     );
                 });
             },
@@ -6461,7 +6472,7 @@ impl App {
         let galley = ui.painter().layout(
             "Preview".to_string(),
             t::semibold(9.5),
-            t::TEXT,
+            t::text(),
             120.0,
         );
         let padding = Vec2::new(5.0, 2.0);
@@ -6476,7 +6487,7 @@ impl App {
             Color32::from_black_alpha(210),
         );
         ui.painter()
-            .galley(rect.min + padding, galley, t::TEXT);
+            .galley(rect.min + padding, galley, t::text());
     }
 
     fn card(&mut self, ui: &mut Ui, card: &VideoCard, width: f32) -> Option<Rect> {
@@ -6491,7 +6502,7 @@ impl App {
             .is_some_and(|open| open.card.id == card.id);
         if lifted {
             ui.painter()
-                .rect_filled(thumb, CornerRadius::same(t::RADIUS), t::PANEL_2);
+                .rect_filled(thumb, CornerRadius::same(t::RADIUS), t::panel_2());
         } else {
             self.paint_thumb(ui, thumb, &card.id, "mq");
         }
@@ -6521,7 +6532,7 @@ impl App {
         if !badge.is_empty() {
             let galley =
                 ui.painter()
-                    .layout(badge, t::semibold(10.5), t::TEXT, 120.0);
+                    .layout(badge, t::semibold(10.5), t::text(), 120.0);
             let padding = Vec2::new(6.0, 2.0);
             let size = galley.size() + padding * 2.0;
             let rect = Rect::from_min_size(
@@ -6530,7 +6541,7 @@ impl App {
             );
             ui.painter()
                 .rect_filled(rect, CornerRadius::same(t::RADIUS_SMALL), Color32::from_black_alpha(215));
-            ui.painter().galley(rect.min + padding, galley, t::TEXT);
+            ui.painter().galley(rect.min + padding, galley, t::text());
         }
         ui.add_space(8.0);
         ui.set_max_width(width);
@@ -6562,7 +6573,7 @@ impl App {
             },
             meta
         );
-        ui.add(egui::Label::new(RichText::new(subtitle).font(t::regular(12.5)).color(t::DIM)).truncate());
+        ui.add(egui::Label::new(RichText::new(subtitle).font(t::regular(12.5)).color(t::dim())).truncate());
 
         if response.clicked() || title.clicked() {
             Some(thumb)
@@ -6624,8 +6635,8 @@ impl App {
             .fixed_pos(egui::pos2(anchor.left(), anchor.bottom() + 6.0))
             .show(ctx, |ui| {
                 egui::Frame::NONE
-                    .fill(t::PANEL_3)
-                    .stroke(Stroke::new(1.0_f32, t::LINE))
+                    .fill(t::panel_3())
+                    .stroke(Stroke::new(1.0_f32, t::line()))
                     .corner_radius(CornerRadius::same(t::RADIUS))
                     .inner_margin(Margin::same(6))
                     .show(ui, |ui| {
@@ -6641,7 +6652,7 @@ impl App {
                                 ui.painter().rect_filled(
                                     row,
                                     CornerRadius::same(t::RADIUS),
-                                    t::PANEL_2,
+                                    t::panel_2(),
                                 );
                             }
                             let icon = Rect::from_min_size(
@@ -6654,7 +6665,7 @@ impl App {
                                 Align2::LEFT_CENTER,
                                 &channel.name,
                                 FontId::proportional(13.0),
-                                t::TEXT,
+                                t::text(),
                             );
                             if channel.subscribers > 0 {
                                 ui.painter().text(
@@ -6665,7 +6676,7 @@ impl App {
                                         t::format_compact(channel.subscribers)
                                     ),
                                     FontId::proportional(10.5),
-                                    t::DIM_2,
+                                    t::dim_2(),
                                 );
                             }
                             if response.clicked() {
@@ -6710,12 +6721,12 @@ impl App {
             }
             None => {
                 ui.painter()
-                    .circle_filled(rect.center(), rect.width() * 0.5, t::PANEL_3);
+                    .circle_filled(rect.center(), rect.width() * 0.5, t::panel_3());
                 let initials = t::initials(&channel.name);
                 if initials.is_empty() {
                     // A nameless result still needs a visible mark, not a
                     // blank grey dot.
-                    t::paint_icon(ui.painter(), rect, &t::Icon::Play, t::DIM_2);
+                    t::paint_icon(ui.painter(), rect, &t::Icon::Play, t::dim_2());
                 } else {
                     ui.painter().text(
                         rect.center(),
@@ -6733,14 +6744,14 @@ impl App {
         ui.add_space(40.0);
         ui.label(RichText::new(title).size(17.0).strong());
         ui.add_space(4.0);
-        ui.label(RichText::new(body).size(12.8).color(t::DIM));
+        ui.label(RichText::new(body).size(12.8).color(t::dim()));
     }
 
     fn error_block(&mut self, ui: &mut Ui, message: &str, which: Which) {
         ui.add_space(20.0);
         ui.label(RichText::new("Something went wrong").size(16.0).strong());
         ui.add_space(4.0);
-        ui.label(RichText::new(message).size(12.5).color(t::DIM));
+        ui.label(RichText::new(message).size(12.5).color(t::dim()));
         ui.add_space(10.0);
         if t::quiet_button(ui, "Try again").clicked() {
             match which {
@@ -6783,8 +6794,8 @@ impl App {
             .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -110.0))
             .show(ctx, |ui| {
                 egui::Frame::NONE
-                    .fill(t::PANEL_3)
-                    .stroke(Stroke::new(1.0_f32, t::LINE))
+                    .fill(t::panel_3())
+                    .stroke(Stroke::new(1.0_f32, t::line()))
                     .corner_radius(CornerRadius::same(t::RADIUS))
                     .inner_margin(Margin::symmetric(18, 10))
                     .show(ui, |ui| {
@@ -6867,7 +6878,7 @@ impl eframe::App for App {
         let frame = if immersive {
             egui::Frame::NONE.fill(Color32::BLACK)
         } else {
-            egui::Frame::NONE.fill(t::BG).inner_margin(Margin {
+            egui::Frame::NONE.fill(t::bg()).inner_margin(Margin {
                 left: 24,
                 right: 0,
                 top: 20,
@@ -7015,6 +7026,13 @@ fn player_width(available: f32, wide: bool) -> f32 {
 /// layout is not already visible behind the image as it travels.
 /// Animation-speed presets. Unknown or missing values fall back to the
 /// original timing, so an old database behaves exactly as before.
+/// An animation covers distance, not time: reversing a half-open drawer has
+/// half as far to go, so it must not replay the full-length slide and stall
+/// for the rest of it.
+fn travel_duration(base: f32, from: f32, to: f32) -> f32 {
+    (base * (to - from).abs()).max(0.001)
+}
+
 fn anim_preset(value: &str) -> &'static str {
     match value.trim() {
         "slow" => "slow",
@@ -7137,6 +7155,13 @@ mod tests {
         // Slow mode stretches the same check, so it swaps later, not earlier.
         assert_eq!(anim_scale("slow") * 0.32, 0.528);
         assert!(!transition_finished(0.32, anim_scale("slow") * 0.32));
+    }
+
+    #[test]
+    fn reversal_takes_only_the_remaining_distance() {
+        assert_eq!(travel_duration(0.2, 0.0, 1.0), 0.2);
+        assert!((travel_duration(0.2, 0.4, 0.0) - 0.08).abs() < 1e-6);
+        assert_eq!(travel_duration(0.0, 1.0, 1.0), 0.001, "a zero-length slide still divides by something");
     }
 
     #[test]
