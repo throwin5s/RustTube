@@ -5,7 +5,9 @@ mod app;
 mod db;
 mod embed;
 mod player;
+mod sponsor;
 mod stream;
+mod summary;
 mod sync;
 mod theme;
 mod update;
@@ -39,8 +41,39 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "RustTube",
         options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+        Box::new(|cc| {
+            #[cfg(target_os = "windows")]
+            round_window_corners(cc);
+            Ok(Box::new(App::new(cc)))
+        }),
     )
+}
+
+/// Windows 11 rounds decorated windows by itself. RustTube has no frame on
+/// Windows (the top bar draws its own caption buttons), so the window opts into
+/// DWM's rounding explicitly. On Windows 10 the attribute is simply ignored.
+#[cfg(target_os = "windows")]
+fn round_window_corners(cc: &eframe::CreationContext<'_>) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    };
+
+    let Ok(handle) = cc.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(window) = handle.as_raw() else {
+        return;
+    };
+    let preference = DWMWCP_ROUND;
+    unsafe {
+        DwmSetWindowAttribute(
+            window.hwnd.get() as _,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            &preference as *const _ as *const _,
+            std::mem::size_of_val(&preference) as u32,
+        );
+    }
 }
 
 /// Embed the generated icon so bundled builds do not depend on the working

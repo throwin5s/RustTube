@@ -11,7 +11,9 @@ No Google account, no RustTube account, no telemetry, no webview, no server of
 its own. Privacy is structural: the only outbound requests are the metadata and
 stream lookups against public instances and YouTube, plus the updater's public
 GitHub release check — no identifiers, no analytics, and the update check can be
-turned off in Settings.
+turned off in Settings. Two optional features leave the machine only when you
+enable them: SponsorBlock (the video ID and category names) and AI summaries
+(the caption text, title and channel to the endpoint you configure).
 
 ## Interface
 
@@ -43,13 +45,14 @@ does not license the symbols; use Reel there.
 | Area | What it does |
 | --- | --- |
 | Trending | Region-based card grid with thumbnails, duration badges and view counts |
-| Search | Channels and videos, with live channel suggestions (icon + name) as you type |
-| Subscriptions | Latest uploads from the channels you follow |
+| Search | Channels and videos, live suggestions as you type, and recommended searches from the channels you watch most |
+| Subscriptions | Latest uploads plus a Continue watching shelf with resume points |
 | Channel | Banner, avatar, subscriber count, subscribe toggle, full upload list |
-| Watch | Player overlay, channel row, expandable description, and Up next |
+| Watch | Player overlay, chapters, next-part button, notes, AI summary, and Up next |
+| Playlists | Local playlists with watched progress, YouTube playlist search, and a queue that survives restarts |
 | History | Resume points, per-item progress, remove and clear |
 | Statistics | Total/weekly watch time, videos opened, streak, 30-day chart, top channels |
-| Settings | Playback defaults, interface options, instance, region, history, cloud sync, local data |
+| Settings | Playback defaults, interface and gamepad, instance, region, history, SponsorBlock, AI, cloud sync, local data |
 
 Settings > Interface has two optional transitions: the sidebar can reveal itself
 when the pointer touches the left edge (the top-bar button then pins it open),
@@ -112,6 +115,30 @@ stream is prefetched; after 700 ms the thumbnail plays from 10% of its duration
 grid, the related rail and History, stop when the pointer leaves the thumbnail,
 and stay on the poster for live items. Settings > Playback can disable them.
 
+### Chapters, queue and sleep timer
+
+A description with leading timestamps becomes a clickable chapter list under the
+video; **N** jumps to the next chapter. When the related list has the following
+part or episode from the same channel, the title row gets a **Next** button. The
+queue is saved locally and survives restarts. The player settings menu has a
+sleep timer: 15, 30 or 60 minutes, or stop at the end of the video (**T** cycles
+it).
+
+### SponsorBlock (opt-in)
+
+Off by default. When enabled in Settings, RustTube asks the public SponsorBlock
+API which ranges in the current video are skippable and jumps over the
+categories you choose. Only the video ID and category names are sent — no
+account, history or watch position. The player menu lists the segments it found.
+Mute and highlight submissions are ignored; only `skip` actions are used.
+
+### Gamepads
+
+With a standard gamepad connected, **A** plays/pauses, **X** mutes, **Y**
+fullscreen, the D-pad seeks and changes volume, and the triggers change speed.
+Gamepad input only applies while a video is open and can be disabled in
+Settings → Interface.
+
 ### Keyboard shortcuts
 
 Shortcuts are ignored while a text field has the keyboard.
@@ -125,6 +152,8 @@ Shortcuts are ignored while a text field has the keyboard.
 | M | Mute/unmute |
 | O, P | Speed down/up |
 | F | Fullscreen (the player bar has the same button) |
+| N | Next chapter |
+| T | Cycle the sleep timer |
 | Esc | Leave fullscreen |
 
 ## Run it
@@ -277,8 +306,10 @@ src/theme.rs   palette, painted icons, cards, progress bar, formatters
 src/embed.rs   libmpv instance, OpenGL FBO renderer, egui paint callback
 src/player.rs  separate mpv process, IPC commands and playback snapshots
 src/stream.rs  InnerTube/yt-dlp stream resolution, memory cache, deduplicated prefetch
-src/api.rs     Invidious + Piped client with per-request instance fallback
-src/db.rs      SQLite schema, watch writes, merge logic
+src/api.rs     Invidious + Piped client, chapters and next-part matching
+src/db.rs      SQLite schema, watch writes, continue-watching, merge logic
+src/summary.rs AI summaries through an OpenAI-compatible endpoint
+src/sponsor.rs opt-in SponsorBlock segment lookup and skipping
 src/sync.rs    folder + WebDAV backends, sync orchestration
 ```
 
@@ -291,8 +322,11 @@ answered last is tried first next time. Any instance can be pinned in Settings.
 - Metadata availability depends on public instances; YouTube rate-limits them
   and disables individual endpoints. Playback still works when detail calls
   fail.
-- No account features (likes, comments, playlists), no downloads, no sponsor
-  skipping.
+- No Google account features (likes, comments, subscribing on YouTube), no
+  downloads. Local playlists and the saved queue cover watching order; YouTube
+  playlists can be searched and played but not edited.
+- SponsorBlock only works when enabled and when the community has segments for
+  that video. AI summaries need your own OpenAI-compatible endpoint and key.
 - Quality is capped at 1080p by default (`DEFAULT_MAX_HEIGHT` in
   `src/stream.rs`). 1440p and 2160p are available when selected explicitly.
 - Sync is a single snapshot file. Two devices writing at the same instant can
@@ -305,9 +339,10 @@ answered last is tried first next time. Any instance can be pinned in Settings.
 ## Verification
 
 `cargo test` covers payload parsing, HTML/entity cleanup, path expansion, URL
-building, InnerTube → HLS stream parsing against captured fixtures, merge
-semantics (tombstones, stale records, idempotent stats) and a two-device folder
-sync round trip.
+building, InnerTube → HLS stream parsing against captured fixtures, chapter
+parsing, next-part matching, SponsorBlock segment filtering, merge semantics
+(tombstones, stale records, idempotent stats) and a two-device folder sync round
+trip.
 
 Three opt-in tests need the outside world:
 

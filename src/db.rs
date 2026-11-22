@@ -10,6 +10,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 
 pub const SYNC_VERSION: u32 = 2;
@@ -28,6 +29,7 @@ pub const SYNCED_SETTINGS: &[&str] = &[
     "watch_zoom",
     "anim_speed",
     "history_enabled",
+    "autoplay_next",
 ];
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -100,6 +102,26 @@ pub struct SavedEntry {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SearchEntry {
+    pub query: String,
+    #[serde(default)]
+    pub searched_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+    #[serde(default)]
+    pub deleted: bool,
+}
+
+/// A timestamped note on a video. Local to this device: notes are for the
+/// half-remembered key behind the waterfall, not a shared document.
+#[derive(Clone, Debug, Default)]
+pub struct VideoNote {
+    pub id: String,
+    pub seconds: f64,
+    pub note: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Playlist {
     pub playlist_id: String,
     #[serde(default)]
@@ -113,6 +135,9 @@ pub struct Playlist {
     /// Computed locally for display; not meaningful in a sync payload.
     #[serde(default)]
     pub item_count: i64,
+    /// Computed locally for display; not meaningful in a sync payload.
+    #[serde(default)]
+    pub watched_count: i64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -164,6 +189,8 @@ pub struct SyncPayload {
     #[serde(default)]
     pub playlist_items: Vec<PlaylistItem>,
     #[serde(default)]
+    pub searches: Vec<SearchEntry>,
+    #[serde(default)]
     pub settings: Vec<SyncedSetting>,
 }
 
@@ -176,6 +203,7 @@ pub struct MergeReport {
     pub saved: usize,
     pub playlists: usize,
     pub playlist_items: usize,
+    pub searches: usize,
     pub settings: usize,
 }
 
@@ -306,6 +334,34 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
             updated_at   INTEGER NOT NULL DEFAULT 0,
             deleted      INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (playlist_id, video_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS searches (
+            query       TEXT PRIMARY KEY,
+            searched_at INTEGER NOT NULL DEFAULT 0,
+            updated_at  INTEGER NOT NULL DEFAULT 0,
+            deleted     INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS searches_recent ON searches(searched_at DESC);
+
+        CREATE TABLE IF NOT EXISTS video_notes (
+            id         TEXT PRIMARY KEY,
+            video_id   TEXT NOT NULL,
+            seconds    REAL NOT NULL DEFAULT 0,
+            note       TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS video_notes_video ON video_notes(video_id, seconds);
+
+        -- Paid-for AI summaries are cached so reopening a walkthrough does not
+        -- spend the user's credits again.
+        CREATE TABLE IF NOT EXISTS summaries (
+            video_id   TEXT PRIMARY KEY,
+            text       TEXT NOT NULL,
+            model      TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT 0
         );
 
         -- When each synced preference was last changed here, so a merge can tell
@@ -541,6 +597,55 @@ pub fn history_position(conn: &Connection, video_id: &str) -> i64 {
     .unwrap_or(0)
 }
 
+/// History entries with a real, unfinished position. Used by the Continue
+/// watching shelf on Subscriptions.
+pub fn continue_watching(conn: &Connection, limit: i64) -> Vec<HistoryEntry> {
+    let mut stmt = match conn.prepare(
+        "SELECT video_id, title, channel_id, channel_name, duration, watched_at, position, updated_at, deleted
+         FROM history WHERE deleted = 0 AND position > 30
+           AND (duration <= 0 OR position < duration - 30)
+         ORDER BY watched_at DESC LIMIT ?1",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return Vec::new(),
+    };
+    let rows = stmt.query_map(params![limit], |row| {
+        Ok(HistoryEntry {
+            video_id: row.get(0)?,
+            title: row.get(1)?,
+            channel_id: row.get(2)?,
+            channel_name: row.get(3)?,
+            duration: row.get(4)?,
+            watched_at: row.get(5)?,
+            position: row.get(6)?,
+            updated_at: row.get(7)?,
+            deleted: row.get::<_, i64>(8)? != 0,
+        })
+    });
+    match rows {
+        Ok(iter) => iter.filter_map(Result::ok).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Videos considered watched: past 90% or past the last 15 seconds. A video
+/// with no known duration counts once there is a position at all.
+pub fn completed_video_ids(conn: &Connection) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT video_id FROM history WHERE deleted = 0 AND position > 0
+           AND (duration <= 0 OR position >= duration - 15 OR position * 10 >= duration * 9)",
+    ) else {
+        return out;
+    };
+    if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+        for id in rows.flatten() {
+            out.insert(id);
+        }
+    }
+    out
+}
+
 pub fn list_history(conn: &Connection, limit: i64) -> Vec<HistoryEntry> {
     let mut stmt = match conn.prepare(
         "SELECT video_id, title, channel_id, channel_name, duration, watched_at, position, updated_at, deleted
@@ -714,7 +819,13 @@ pub fn list_playlists(conn: &Connection) -> Vec<Playlist> {
     let mut stmt = match conn.prepare(
         "SELECT p.playlist_id, p.name, p.created_at, p.updated_at, p.deleted,
                 (SELECT COUNT(*) FROM playlist_items i
-                 WHERE i.playlist_id = p.playlist_id AND i.deleted = 0)
+                 WHERE i.playlist_id = p.playlist_id AND i.deleted = 0),
+                (SELECT COUNT(*) FROM playlist_items i
+                 JOIN history h ON h.video_id = i.video_id AND h.deleted = 0
+                 WHERE i.playlist_id = p.playlist_id AND i.deleted = 0
+                   AND h.position > 0
+                   AND (h.duration <= 0 OR h.position >= h.duration - 15
+                        OR h.position * 10 >= h.duration * 9))
          FROM playlists p WHERE p.deleted = 0
          ORDER BY p.created_at ASC",
     ) {
@@ -729,6 +840,7 @@ pub fn list_playlists(conn: &Connection) -> Vec<Playlist> {
             updated_at: row.get(3)?,
             deleted: row.get::<_, i64>(4)? != 0,
             item_count: row.get(5)?,
+            watched_count: row.get(6)?,
         })
     });
     match rows {
@@ -831,6 +943,148 @@ pub fn list_playlist_items(conn: &Connection, playlist_id: &str) -> Vec<Playlist
         Ok(iter) => iter.filter_map(Result::ok).collect(),
         Err(_) => Vec::new(),
     }
+}
+
+// ------------------------------------------------------------- recent searches
+
+pub fn record_search(conn: &Connection, query: &str) -> rusqlite::Result<()> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(());
+    }
+    let now = now_ms();
+    // Two different searches can land in the same millisecond. Give every new
+    // row a strictly larger stamp so the newest is always first.
+    let newest: i64 = conn
+        .query_row("SELECT COALESCE(MAX(searched_at), 0) FROM searches", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or(0);
+    let stamp = now.max(newest + 1);
+    conn.execute(
+        "INSERT INTO searches(query, searched_at, updated_at, deleted)
+         VALUES(?1, ?2, ?2, 0)
+         ON CONFLICT(query) DO UPDATE SET
+            searched_at = MAX(excluded.searched_at, searches.searched_at + 1),
+            updated_at  = MAX(excluded.updated_at, searches.updated_at + 1),
+            deleted     = 0",
+        params![query, stamp],
+    )?;
+    Ok(())
+}
+
+pub fn list_searches(conn: &Connection, limit: i64) -> Vec<SearchEntry> {
+    let mut stmt = match conn.prepare(
+        "SELECT query, searched_at, updated_at, deleted FROM searches
+         WHERE deleted = 0 ORDER BY searched_at DESC LIMIT ?1",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return Vec::new(),
+    };
+    let rows = stmt.query_map(params![limit], |row| {
+        Ok(SearchEntry {
+            query: row.get(0)?,
+            searched_at: row.get(1)?,
+            updated_at: row.get(2)?,
+            deleted: row.get::<_, i64>(3)? != 0,
+        })
+    });
+    match rows {
+        Ok(iter) => iter.filter_map(Result::ok).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+pub fn delete_search(conn: &Connection, query: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE searches SET deleted = 1, updated_at = MAX(?2, updated_at + 1)
+         WHERE query = ?1",
+        params![query, now_ms()],
+    )?;
+    Ok(())
+}
+
+pub fn clear_searches(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE searches SET deleted = 1, updated_at = ?1 WHERE deleted = 0",
+        params![now_ms()],
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------- video notes
+
+pub fn add_note(
+    conn: &Connection,
+    video_id: &str,
+    seconds: f64,
+    note: &str,
+) -> rusqlite::Result<String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO video_notes(id, video_id, seconds, note, created_at)
+         VALUES(?1, ?2, ?3, ?4, ?5)",
+        params![id, video_id, seconds.max(0.0), note.trim(), now_ms()],
+    )?;
+    Ok(id)
+}
+
+pub fn list_notes(conn: &Connection, video_id: &str) -> Vec<VideoNote> {
+    let mut stmt = match conn.prepare(
+        "SELECT id, seconds, note FROM video_notes
+         WHERE video_id = ?1 ORDER BY seconds ASC, created_at ASC",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return Vec::new(),
+    };
+    let rows = stmt.query_map(params![video_id], |row| {
+        Ok(VideoNote {
+            id: row.get(0)?,
+            seconds: row.get(1)?,
+            note: row.get(2)?,
+        })
+    });
+    match rows {
+        Ok(iter) => iter.filter_map(Result::ok).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+pub fn delete_note(conn: &Connection, id: &str) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM video_notes WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+// -------------------------------------------------------------- AI summaries
+
+pub fn load_summary(conn: &Connection, video_id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT text FROM summaries WHERE video_id = ?1",
+        params![video_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .filter(|text: &String| !text.trim().is_empty())
+}
+
+pub fn save_summary(
+    conn: &Connection,
+    video_id: &str,
+    text: &str,
+    model: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO summaries(video_id, text, model, created_at)
+         VALUES(?1, ?2, ?3, ?4)
+         ON CONFLICT(video_id) DO UPDATE SET
+            text       = excluded.text,
+            model      = excluded.model,
+            created_at = excluded.created_at",
+        params![video_id, text, model, now_ms()],
+    )?;
+    Ok(())
 }
 
 // ----------------------------------------------------------------- statistics
@@ -1031,6 +1285,24 @@ pub fn export_payload(conn: &Connection, generated_by: &str) -> SyncPayload {
                     updated_at: row.get(3)?,
                     deleted: row.get::<_, i64>(4)? != 0,
                     item_count: 0,
+                    watched_count: 0,
+                })
+            })?;
+            Ok(rows.flatten().collect::<Vec<_>>())
+        }) {
+        Ok(list) => list,
+        Err(_) => Vec::new(),
+    };
+
+    let searches = match conn
+        .prepare("SELECT query, searched_at, updated_at, deleted FROM searches")
+        .and_then(|mut stmt| {
+            let rows = stmt.query_map([], |row| {
+                Ok(SearchEntry {
+                    query: row.get(0)?,
+                    searched_at: row.get(1)?,
+                    updated_at: row.get(2)?,
+                    deleted: row.get::<_, i64>(3)? != 0,
                 })
             })?;
             Ok(rows.flatten().collect::<Vec<_>>())
@@ -1096,6 +1368,7 @@ pub fn export_payload(conn: &Connection, generated_by: &str) -> SyncPayload {
         saved,
         playlists,
         playlist_items,
+        searches,
         settings,
     }
 }
@@ -1276,6 +1549,27 @@ pub fn merge_payload(conn: &mut Connection, payload: &SyncPayload) -> Result<Mer
         report.playlist_items += changed;
     }
 
+    for item in &payload.searches {
+        let changed = tx
+            .execute(
+                "INSERT INTO searches(query, searched_at, updated_at, deleted)
+                 VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(query) DO UPDATE SET
+                    searched_at = excluded.searched_at,
+                    updated_at  = excluded.updated_at,
+                    deleted     = excluded.deleted
+                 WHERE excluded.updated_at > searches.updated_at",
+                params![
+                    item.query,
+                    item.searched_at,
+                    item.updated_at,
+                    item.deleted as i64
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        report.searches += changed;
+    }
+
     for setting in &payload.settings {
         if !SYNCED_SETTINGS.contains(&setting.key.as_str()) {
             continue;
@@ -1313,6 +1607,7 @@ pub fn merge_payload(conn: &mut Connection, payload: &SyncPayload) -> Result<Mer
         + report.saved
         + report.playlists
         + report.playlist_items
+        + report.searches
         + report.settings;
     Ok(report)
 }
@@ -1456,6 +1751,41 @@ mod tests {
         let mut conn = memory_db();
         let payload = SyncPayload { version: SYNC_VERSION + 1, ..Default::default() };
         assert!(merge_payload(&mut conn, &payload).is_err());
+    }
+
+    #[test]
+    fn recent_searches_sync_and_clear() {
+        let a = memory_db();
+        record_search(&a, "zelda walkthrough").unwrap();
+        record_search(&a, "hollow knight").unwrap();
+        let recent = list_searches(&a, 8);
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].query, "hollow knight");
+
+        let mut b = memory_db();
+        merge_payload(&mut b, &export_payload(&a, "dev-a")).unwrap();
+        assert_eq!(list_searches(&b, 8).len(), 2);
+
+        clear_searches(&a).unwrap();
+        merge_payload(&mut b, &export_payload(&a, "dev-a")).unwrap();
+        assert!(list_searches(&b, 8).is_empty(), "clears must propagate");
+        record_search(&a, "hollow knight").unwrap();
+        assert_eq!(list_searches(&a, 8).len(), 1);
+    }
+
+    #[test]
+    fn notes_and_summaries_stay_local() {
+        let conn = memory_db();
+        add_note(&conn, "v1", 125.0, "key behind the waterfall").unwrap();
+        let notes = list_notes(&conn, "v1");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].seconds, 125.0);
+        delete_note(&conn, &notes[0].id).unwrap();
+        assert!(list_notes(&conn, "v1").is_empty());
+
+        save_summary(&conn, "v1", "A compact guide.", "test-model").unwrap();
+        assert_eq!(load_summary(&conn, "v1").as_deref(), Some("A compact guide."));
+        assert!(export_payload(&conn, "dev-a").searches.is_empty());
     }
 
     #[test]
